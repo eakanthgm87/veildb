@@ -12,10 +12,12 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::StorageError;
-use crate::types::{DeviceEntry, LogicalClock, Operation, OperationId, Snapshot, SnapshotId};
+use crate::types::{
+    DeviceEntry, LogicalClock, MergeLogEntry, Operation, OperationId, Snapshot, SnapshotId,
+};
 
 /// The current schema version.
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// The storage engine trait.
 ///
@@ -73,6 +75,9 @@ pub trait StorageEngine {
     /// Load a metadata value by key.
     fn get_metadata(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError>;
 
+    /// Delete a metadata entry.
+    fn delete_metadata(&mut self, key: &str) -> Result<(), StorageError>;
+
     /// Get the total number of operations in the log.
     fn operation_count(&self) -> Result<u64, StorageError>;
 
@@ -92,6 +97,30 @@ pub trait StorageEngine {
         device_id: &[u8; 32],
         sequence: u64,
     ) -> Result<(), StorageError>;
+
+    /// Record a deterministic conflict resolution in the merge log.
+    ///
+    /// Idempotent: recording the same (key, winner, loser) triple
+    /// twice is a no-op.
+    fn record_merge_entry(
+        &mut self,
+        key: &str,
+        winner: OperationId,
+        loser: Option<OperationId>,
+        rule: &str,
+    ) -> Result<(), StorageError>;
+
+    /// List all merge-log entries, oldest first.
+    fn list_merge_entries(&self) -> Result<Vec<MergeLogEntry>, StorageError>;
+
+    /// Check whether a merge-log entry already exists for the given
+    /// (key, winner, loser) triple.
+    fn merge_entry_exists(
+        &self,
+        key: &str,
+        winner: &OperationId,
+        loser: Option<&OperationId>,
+    ) -> Result<bool, StorageError>;
 }
 
 /// SQLite-backed implementation of [`StorageEngine`].
@@ -162,6 +191,10 @@ impl SqliteStorage {
             self.migrate_to_v1()?;
         }
 
+        if current < 2 {
+            self.migrate_to_v2()?;
+        }
+
         Ok(())
     }
 
@@ -212,6 +245,37 @@ impl SqliteStorage {
             CREATE INDEX IF NOT EXISTS idx_operations_device_seq
                 ON operations(device_id, sequence_number);
             "#,
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Migrate from schema v1 to v2: add the merge log table.
+    fn migrate_to_v2(&mut self) -> Result<(), StorageError> {
+        let tx = self.conn.transaction()?;
+
+        tx.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS merge_log (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                key            TEXT NOT NULL,
+                winner_device  BLOB NOT NULL,
+                winner_seq     INTEGER NOT NULL,
+                loser_device   BLOB,
+                loser_seq      INTEGER,
+                rule           TEXT NOT NULL,
+                created_at     INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_merge_log_key
+                ON merge_log(key);
+            "#,
+        )?;
+
+        tx.execute(
+            "INSERT INTO schema_version (version) VALUES (2)",
+            [],
         )?;
 
         tx.commit()?;
@@ -579,6 +643,111 @@ impl StorageEngine for SqliteStorage {
         Ok(())
     }
 
+    fn record_merge_entry(
+        &mut self,
+        key: &str,
+        winner: OperationId,
+        loser: Option<OperationId>,
+        rule: &str,
+    ) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT INTO merge_log
+                (key, winner_device, winner_seq, loser_device, loser_seq, rule, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                key,
+                winner.device_id.to_vec(),
+                winner.sequence as i64,
+                loser.map(|l| l.device_id.to_vec()),
+                loser.map(|l| l.sequence as i64),
+                rule,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn list_merge_entries(&self) -> Result<Vec<MergeLogEntry>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, key, winner_device, winner_seq, loser_device, loser_seq, rule, created_at
+             FROM merge_log ORDER BY id",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            let winner_device: Vec<u8> = row.get(2)?;
+            let loser_device: Option<Vec<u8>> = row.get(4)?;
+            let loser_seq: Option<i64> = row.get(5)?;
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                winner_device,
+                row.get::<_, i64>(3)?,
+                loser_device,
+                loser_seq,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        })?;
+
+        let mut result = Vec::new();
+        for r in rows {
+            let r = r?;
+            let mut winner_dev = [0u8; 32];
+            winner_dev.copy_from_slice(&r.2[..32.min(r.2.len())]);
+            let loser = r.4.and_then(|d| {
+                if d.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&d);
+                    r.5.map(|s| OperationId::new(arr, s as u64))
+                } else {
+                    None
+                }
+            });
+            result.push(MergeLogEntry {
+                id: r.0,
+                key: r.1,
+                winner: OperationId::new(winner_dev, r.3 as u64),
+                loser,
+                rule: r.6,
+                created_at: r.7,
+            });
+        }
+        Ok(result)
+    }
+
+    fn merge_entry_exists(
+        &self,
+        key: &str,
+        winner: &OperationId,
+        loser: Option<&OperationId>,
+    ) -> Result<bool, StorageError> {
+        let (loser_dev, loser_seq): (Option<Vec<u8>>, Option<i64>) = match loser {
+            Some(l) => (Some(l.device_id.to_vec()), Some(l.sequence as i64)),
+            None => (None, None),
+        };
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM merge_log
+                 WHERE key = ?1 AND winner_device = ?2 AND winner_seq = ?3
+                   AND loser_device IS ?4 AND loser_seq IS ?5
+                 LIMIT 1",
+                params![
+                    key,
+                    winner.device_id.to_vec(),
+                    winner.sequence as i64,
+                    loser_dev,
+                    loser_seq
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     fn set_metadata(&mut self, key: &str, value: &[u8]) -> Result<(), StorageError> {
         self.conn.execute(
             "INSERT INTO metadata (key, value) VALUES (?1, ?2)
@@ -598,6 +767,12 @@ impl StorageEngine for SqliteStorage {
             )
             .optional()?;
         Ok(value)
+    }
+
+    fn delete_metadata(&mut self, key: &str) -> Result<(), StorageError> {
+        self.conn
+            .execute("DELETE FROM metadata WHERE key = ?1", params![key])?;
+        Ok(())
     }
 
     fn operation_count(&self) -> Result<u64, StorageError> {

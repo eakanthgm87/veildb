@@ -12,7 +12,9 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
-use veildb_core::{IntegrityStatus, LogicalClock, SecretString, SyncBackendKind, VeilDbCore};
+use veildb_core::{
+    IntegrityStatus, LogicalClock, PairingBundle, SecretString, SyncBackendKind, VeilDbCore,
+};
 
 /// The shared application state holding the core instance.
 pub struct AppState {
@@ -478,6 +480,152 @@ mod commands {
         }
     }
 
+    /// Accept ONE incoming TCP sync session (server / listen side).
+    ///
+    /// Blocks until a peer connects and the handshake completes. Use
+    /// `vdb_sync_lan` on the dialing side.
+    #[tauri::command]
+    pub fn vdb_sync_listen(
+        state: State<'_, AppState>,
+        addr: String,
+    ) -> ApiResponse<serde_json::Value> {
+        let mut guard = state.core.lock().unwrap();
+        let core_ref = match guard.as_mut() {
+            Some(c) => c,
+            None => return ApiResponse::err(not_initialized()),
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        match rt.block_on(core_ref.sync_listen_once(&addr)) {
+            Ok(report) => ApiResponse::ok(serde_json::json!({
+                "operations_received": report.operations_received,
+                "operations_sent": report.operations_sent,
+                "operations_merged": report.operations_merged,
+                "merkle_root": hex(&report.merkle_root),
+                "success": report.success,
+                "message": report.message,
+            })),
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
+
+    /// Export a signed pairing bundle for a new device.
+    ///
+    /// Returns the bundle as pretty JSON. The joining device presents
+    /// it via `vdb_import_pairing`.
+    #[tauri::command]
+    pub fn vdb_export_pairing(
+        state: State<'_, AppState>,
+    ) -> ApiResponse<serde_json::Value> {
+        let guard = state.core.lock().unwrap();
+        let core_ref = match guard.as_ref() {
+            Some(c) => c,
+            None => return ApiResponse::err(not_initialized()),
+        };
+        match core_ref.export_pairing() {
+            Ok(bundle) => {
+                let json = match bundle.to_json() {
+                    Ok(j) => j,
+                    Err(e) => return ApiResponse::err(ApiError::from(e)),
+                };
+                ApiResponse::ok(serde_json::json!({
+                    "db_id": hex(&bundle.db_id),
+                    "salt": hex(&bundle.salt),
+                    "device_id": hex(&bundle.device_id),
+                    "approver_public_key": hex(&bundle.approver_public_key),
+                    "signature": hex(&bundle.signature),
+                    "json": json,
+                }))
+            }
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
+
+    /// Import a pairing bundle and approve the inviting device.
+    ///
+    /// Takes the bundle's serialized JSON (as exported by
+    /// `vdb_export_pairing`). If this device's database is still
+    /// empty and belongs to a different database, it adopts the
+    /// inviting database's identity (db_id + KDF salt).
+    #[tauri::command]
+    pub fn vdb_import_pairing(
+        state: State<'_, AppState>,
+        bundle_json: String,
+    ) -> ApiResponse<serde_json::Value> {
+        let bundle = match PairingBundle::from_json(&bundle_json) {
+            Ok(b) => b,
+            Err(e) => return ApiResponse::err(ApiError::from(e)),
+        };
+        let mut guard = state.core.lock().unwrap();
+        let core_ref = match guard.as_mut() {
+            Some(c) => c,
+            None => return ApiResponse::err(not_initialized()),
+        };
+        match core_ref.import_pairing(&bundle) {
+            Ok(entry) => ApiResponse::ok(serde_json::json!({
+                "device_id": hex(&entry.device_id),
+                "public_key": hex(&entry.public_key),
+                "trusted": entry.trusted,
+                "approved_by": entry.approved_by.map(|a| hex(&a)),
+                "created_at": entry.created_at,
+            })),
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
+
+    /// Discover peers on the LAN via UDP multicast.
+    #[tauri::command]
+    pub fn vdb_discover(
+        state: State<'_, AppState>,
+        timeout_ms: u64,
+    ) -> ApiResponse<serde_json::Value> {
+        let guard = state.core.lock().unwrap();
+        let core_ref = match guard.as_ref() {
+            Some(c) => c,
+            None => return ApiResponse::err(not_initialized()),
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        match rt.block_on(core_ref.discover_peers(timeout_ms)) {
+            Ok(peers) => {
+                let list: Vec<serde_json::Value> = peers.iter().map(|p| {
+                    serde_json::json!({
+                        "device_id": hex(&p.device_id),
+                        "public_key": hex(&p.public_key),
+                        "sync_addr": p.sync_addr.to_string(),
+                    })
+                }).collect();
+                ApiResponse::ok(serde_json::json!({ "peers": list }))
+            }
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
+
+    /// Query the persistent merge log (deterministic conflict resolutions).
+    #[tauri::command]
+    pub fn vdb_merges(state: State<'_, AppState>) -> ApiResponse<serde_json::Value> {
+        let guard = state.core.lock().unwrap();
+        let core_ref = match guard.as_ref() {
+            Some(c) => c,
+            None => return ApiResponse::err(not_initialized()),
+        };
+        match core_ref.merge_log() {
+            Ok(entries) => {
+                let list: Vec<serde_json::Value> = entries.iter().map(|e| {
+                    serde_json::json!({
+                        "id": e.id,
+                        "key": e.key,
+                        "winner": format!("{}.{}", hex(&e.winner.device_id), e.winner.sequence),
+                        "loser": e.loser.map(|l| format!("{}.{}", hex(&l.device_id), l.sequence)),
+                        "rule": e.rule,
+                        "created_at": e.created_at,
+                    })
+                }).collect();
+                ApiResponse::ok(serde_json::json!({ "entries": list }))
+            }
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
+
     #[tauri::command]
     pub fn vdb_rotate_key(state: State<'_, AppState>) -> ApiResponse<serde_json::Value> {
         let mut guard = state.core.lock().unwrap();
@@ -687,6 +835,11 @@ pub fn run() {
             vdb_restore,
             vdb_snapshot,
             vdb_sync_lan,
+            vdb_sync_listen,
+            vdb_export_pairing,
+            vdb_import_pairing,
+            vdb_discover,
+            vdb_merges,
             vdb_rotate_key,
             vdb_get_dag,
             vdb_get_merkle_tree,

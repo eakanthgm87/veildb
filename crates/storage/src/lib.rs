@@ -15,5 +15,6 @@ pub mod types;
 pub use engine::{SCHEMA_VERSION, SqliteStorage, StorageEngine};
 pub use error::StorageError;
 pub use types::{
-    DeviceEntry, LogicalClock, Operation, OperationId, SecretString, Snapshot, SnapshotId,
+    DeviceEntry, LogicalClock, MergeLogEntry, Operation, OperationId, SecretString, Snapshot,
+    SnapshotId,
 };

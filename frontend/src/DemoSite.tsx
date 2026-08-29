@@ -17,11 +17,6 @@ interface VdbStats {
 }
 
 /* ─── Helpers ─── */
-function escapeHtml(s: string) {
-  const d = document.createElement("div");
-  d.textContent = s;
-  return d.innerHTML;
-}
 
 /* ============================================================
    DemoSite — A standalone auth website powered by VeilDB

@@ -2,7 +2,14 @@ import { useState, useEffect } from "react";
 import { api } from "./mockApi";
 import { open } from "@tauri-apps/plugin-dialog";
 import UserDemo from "./UserDemo";
-import type { DbStatus, DeviceInfo, OperationSummary } from "./types";
+import type {
+  DbStatus,
+  DeviceInfo,
+  OperationSummary,
+  PairingBundle,
+  DiscoveredPeer,
+  MergeEntry,
+} from "./types";
 
 type Tab =
   | "dashboard"
@@ -80,6 +87,17 @@ function App() {
   const [integrity, setIntegrity] = useState<IntegrityResult | null>(null);
   const [syncLog, setSyncLog] = useState<string[]>([]);
   const [syncing, setSyncing] = useState(false);
+
+  // Pairing state.
+  const [pairingBundle, setPairingBundle] = useState<PairingBundle | null>(null);
+  const [pairingJson, setPairingJson] = useState("");
+
+  // Peer discovery state.
+  const [discoveredPeers, setDiscoveredPeers] = useState<DiscoveredPeer[]>([]);
+  const [discovering, setDiscovering] = useState(false);
+
+  // Merge log state.
+  const [merges, setMerges] = useState<MergeEntry[]>([]);
 
   // Sync peer address.
   const [syncAddr, setSyncAddr] = useState("127.0.0.1:8443");
@@ -420,6 +438,73 @@ function App() {
       }
     } finally {
       setSyncing(false);
+    }
+  }
+
+  async function handleExportPairing() {
+    setError(null);
+    try {
+      const result = await api.exportPairing();
+      if (result.success && result.data) {
+        setPairingBundle(result.data);
+      } else {
+        setError(result.error?.message || "Export pairing failed");
+      }
+    } catch (e: any) {
+      setError(e.message || String(e));
+    }
+  }
+
+  async function handleImportPairing() {
+    setError(null);
+    if (!pairingJson.trim()) {
+      setError("Paste a pairing bundle JSON first");
+      return;
+    }
+    try {
+      const result = await api.importPairing(pairingJson.trim());
+      if (result.success) {
+        setPairingJson("");
+        setPairingBundle(null);
+        refreshDevices();
+        refreshStatus();
+      } else {
+        setError(result.error?.message || "Import pairing failed");
+      }
+    } catch (e: any) {
+      setError(e.message || String(e));
+    }
+  }
+
+  async function handleDiscover() {
+    setError(null);
+    setDiscovering(true);
+    setDiscoveredPeers([]);
+    try {
+      const result = await api.discoverPeers(2000);
+      if (result.success && result.data) {
+        setDiscoveredPeers(result.data.peers || []);
+      } else {
+        setError(result.error?.message || "Discovery failed");
+      }
+    } catch (e: any) {
+      setError(e.message || String(e));
+    } finally {
+      setDiscovering(false);
+    }
+  }
+
+  async function handleListMerges() {
+    setError(null);
+    try {
+      const result = await api.listMerges();
+      if (result.success && result.data) {
+        setMerges(result.data.entries || []);
+      } else {
+        setError(result.error?.message || "List merges failed");
+      }
+    } catch (e: any) {
+      setError(e.message || String(e));
     }
   }
 
@@ -774,6 +859,16 @@ function App() {
                   onSyncAddrChange={setSyncAddr}
                   onSync={handleSync}
                   onViewGraph={() => setActiveTab("graph")}
+                  pairingBundle={pairingBundle}
+                  pairingJson={pairingJson}
+                  onPairingJsonChange={setPairingJson}
+                  onExportPairing={handleExportPairing}
+                  onImportPairing={handleImportPairing}
+                  discoveredPeers={discoveredPeers}
+                  discovering={discovering}
+                  onDiscover={handleDiscover}
+                  merges={merges}
+                  onListMerges={handleListMerges}
                 />
               )}
               {activeTab === "time-travel" && (
@@ -1135,6 +1230,16 @@ function Sync({
   onSyncAddrChange,
   onSync,
   onViewGraph,
+  pairingBundle,
+  pairingJson,
+  onPairingJsonChange,
+  onExportPairing,
+  onImportPairing,
+  discoveredPeers,
+  discovering,
+  onDiscover,
+  merges,
+  onListMerges,
 }: {
   syncing: boolean;
   syncLog: string[];
@@ -1142,6 +1247,16 @@ function Sync({
   onSyncAddrChange: (v: string) => void;
   onSync: () => void;
   onViewGraph: () => void;
+  pairingBundle: PairingBundle | null;
+  pairingJson: string;
+  onPairingJsonChange: (v: string) => void;
+  onExportPairing: () => void;
+  onImportPairing: () => void;
+  discoveredPeers: DiscoveredPeer[];
+  discovering: boolean;
+  onDiscover: () => void;
+  merges: MergeEntry[];
+  onListMerges: () => void;
 }) {
   return (
     <div className="space-y-6">
@@ -1175,6 +1290,125 @@ function Sync({
           >
             View Operation Graph
           </button>
+        </div>
+      </div>
+
+      <div className="bg-dark-800 border border-slate-700 rounded p-4">
+        <h3 className="text-lg font-medium mb-3">Pairing</h3>
+        <p className="text-xs text-slate-400 mb-2">
+          Export a pairing bundle to let another device join this database, or
+          paste a bundle you received to join an existing one.
+        </p>
+        <div className="space-y-2">
+          <button
+            onClick={onExportPairing}
+            className="w-full bg-primary-600 hover:bg-primary-700 text-white rounded px-3 py-2 text-sm"
+          >
+            Export Pairing Bundle
+          </button>
+          {pairingBundle && (
+            <div className="bg-dark-900 border border-slate-700 rounded p-2">
+              <p className="text-xs text-slate-400 mb-1">
+                Bundle (give this to the joining device):
+              </p>
+              <pre className="text-xs font-mono break-all whitespace-pre-wrap max-h-40 overflow-y-auto">
+                {pairingBundle.json}
+              </pre>
+              <button
+                onClick={() => navigator.clipboard?.writeText(pairingBundle.json)}
+                className="mt-1 text-xs text-primary-400 hover:text-primary-300"
+              >
+                Copy to clipboard
+              </button>
+            </div>
+          )}
+          <textarea
+            value={pairingJson}
+            onChange={(e) => onPairingJsonChange(e.target.value)}
+            placeholder="Paste a pairing bundle JSON here, then click Import..."
+            rows={4}
+            className="w-full bg-dark-900 border border-slate-600 rounded px-3 py-2 text-xs font-mono"
+          />
+          <button
+            onClick={onImportPairing}
+            className="w-full bg-dark-700 hover:bg-dark-600 rounded px-3 py-2 text-sm"
+          >
+            Import Pairing Bundle
+          </button>
+        </div>
+      </div>
+
+      <div className="bg-dark-800 border border-slate-700 rounded p-4">
+        <h3 className="text-lg font-medium mb-3">Peer Discovery</h3>
+        <div className="space-y-2">
+          <button
+            onClick={onDiscover}
+            disabled={discovering}
+            className="w-full bg-primary-600 hover:bg-primary-700 disabled:bg-slate-600 text-white rounded px-3 py-2 text-sm"
+          >
+            {discovering ? "Discovering..." : "Discover LAN Peers"}
+          </button>
+          {discoveredPeers.length > 0 ? (
+            <div className="space-y-1">
+              {discoveredPeers.map((p) => (
+                <div
+                  key={p.device_id}
+                  className="flex items-center justify-between bg-dark-900 rounded border border-slate-700 p-2"
+                >
+                  <div>
+                    <p className="text-xs font-mono">{hex(p.device_id)}</p>
+                    <p className="text-xs text-slate-400 font-mono">
+                      {p.sync_addr}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => onSyncAddrChange(p.sync_addr)}
+                    className="text-xs bg-dark-700 hover:bg-dark-600 px-2 py-1 rounded"
+                  >
+                    Use
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-xs text-slate-400">
+              No peers discovered yet. Run discovery on the local network.
+            </p>
+          )}
+        </div>
+      </div>
+
+      <div className="bg-dark-800 border border-slate-700 rounded p-4">
+        <h3 className="text-lg font-medium mb-3">Merge Log</h3>
+        <div className="space-y-2">
+          <button
+            onClick={onListMerges}
+            className="w-full bg-primary-600 hover:bg-primary-700 text-white rounded px-3 py-2 text-sm"
+          >
+            View Merge Log
+          </button>
+          {merges.length > 0 ? (
+            <div className="space-y-1">
+              {merges.map((m, i) => (
+                <div
+                  key={i}
+                  className="bg-dark-900 rounded border border-slate-700 p-2"
+                >
+                  <p className="text-xs font-mono">
+                    {m.key} → {hex(m.winner_value)}
+                  </p>
+                  <p className="text-xs text-slate-400">
+                    winner: {hex(m.winner_device_id)} · resolved:{" "}
+                    {m.resolved_at}
+                  </p>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-xs text-slate-400">
+              No conflict merges recorded yet.
+            </p>
+          )}
         </div>
       </div>
 

@@ -49,7 +49,17 @@ interface MockState {
   selfDeviceId: string;
   selfPublicKey: string;
   dbId: string;
+  salt: string;
   lastSync: string | null;
+  discoveredPeers: { device_id: string; public_key: string; sync_addr: string }[];
+  merges: {
+    id: number;
+    key: string;
+    winner: string;
+    loser: string | null;
+    rule: string;
+    created_at: number;
+  }[];
 }
 
 let mock: MockState | null = null;
@@ -91,7 +101,10 @@ function mockInit(path: string, passphrase: string): any {
     selfDeviceId,
     selfPublicKey,
     dbId: randomHex(64),
+    salt: randomHex(64),
     lastSync: null,
+    discoveredPeers: [],
+    merges: [],
   };
   return {
     db_id: mock.dbId,
@@ -249,6 +262,85 @@ function mockSyncLan(addr: string): any {
   };
 }
 
+function mockSyncListen(addr: string): any {
+  requireMock();
+  mock!.lastSync = new Date().toISOString();
+  return {
+    operations_received: mock!.operations.length,
+    operations_sent: 0,
+    operations_merged: mock!.operations.length,
+    merkle_root: mock!.merkleRoot,
+    success: true,
+    message: `Mock accepted sync on ${addr}`,
+  };
+}
+
+function mockExportPairing(): any {
+  requireMock();
+  return {
+    db_id: mock!.dbId,
+    salt: mock!.salt,
+    device_id: mock!.selfDeviceId,
+    approver_public_key: mock!.selfPublicKey,
+    signature: randomHex(128),
+    json: JSON.stringify(
+      {
+        db_id: mock!.dbId,
+        salt: mock!.salt,
+        device_id: mock!.selfDeviceId,
+        approver_public_key: mock!.selfPublicKey,
+        signature: randomHex(128),
+      },
+      null,
+      2
+    ),
+  };
+}
+
+function mockImportPairing(bundleJson: string): any {
+  requireMock();
+  let parsed: any;
+  try {
+    parsed = JSON.parse(bundleJson);
+  } catch {
+    throw new Error("Invalid pairing bundle JSON");
+  }
+  const deviceId = parsed.device_id || randomHex(64);
+  const publicKey = parsed.approver_public_key || randomHex(64);
+  // If this device's db is empty and belongs to a different db, adopt
+  // the inviting db's identity (mock demo of the join step).
+  if (mock!.operations.length === 0 && parsed.db_id && parsed.db_id !== mock!.dbId) {
+    mock!.dbId = parsed.db_id;
+    if (parsed.salt) mock!.salt = parsed.salt;
+  }
+  mock!.devices.push({
+    device_id: deviceId,
+    public_key: publicKey,
+    trusted: true,
+    approved_by: mock!.selfDeviceId,
+    created_at: Date.now(),
+  });
+  return {
+    device_id: deviceId,
+    public_key: publicKey,
+    trusted: true,
+    approved_by: mock!.selfDeviceId,
+    created_at: Date.now(),
+  };
+}
+
+function mockDiscoverPeers(_timeoutMs: number): any {
+  requireMock();
+  // In mock mode there are no real peers.
+  mock!.discoveredPeers = [];
+  return { peers: mock!.discoveredPeers };
+}
+
+function mockMerges(): any {
+  requireMock();
+  return { entries: mock!.merges };
+}
+
 function mockRotateKey(): any {
   requireMock();
   mock!.keyVersion += 1;
@@ -391,6 +483,18 @@ async function call<T>(cmd: string, args: Record<string, unknown>): Promise<ApiR
         return ok(mockSnapshot() as T);
       case "vdb_sync_lan":
         return ok(mockSyncLan(args.addr as string) as T);
+      case "vdb_sync_listen":
+        return ok(mockSyncListen(args.addr as string) as T);
+      case "vdb_export_pairing":
+        return ok(mockExportPairing() as T);
+      case "vdb_import_pairing":
+        return ok(mockImportPairing(args.bundleJson as string) as T);
+      case "vdb_discover":
+        return ok(
+          mockDiscoverPeers((args.timeoutMs as number) ?? 2000) as T
+        );
+      case "vdb_merges":
+        return ok(mockMerges() as T);
       case "vdb_rotate_key":
         return ok(mockRotateKey() as T);
       case "vdb_get_dag":
@@ -432,6 +536,13 @@ export const api = {
   restore: (archive: string) => call<any>("vdb_restore", { archive }),
   snapshot: () => call<number>("vdb_snapshot", {}),
   syncLan: (addr: string) => call<any>("vdb_sync_lan", { addr }),
+  syncListen: (addr: string) => call<any>("vdb_sync_listen", { addr }),
+  exportPairing: () => call<any>("vdb_export_pairing", {}),
+  importPairing: (bundleJson: string) =>
+    call<any>("vdb_import_pairing", { bundleJson }),
+  discoverPeers: (timeoutMs?: number) =>
+    call<any>("vdb_discover", { timeoutMs }),
+  listMerges: () => call<any>("vdb_merges", {}),
   rotateKey: () => call<any>("vdb_rotate_key", {}),
   getDag: () => call<any>("vdb_get_dag", {}),
   getMerkleTree: () => call<any>("vdb_get_merkle_tree", {}),

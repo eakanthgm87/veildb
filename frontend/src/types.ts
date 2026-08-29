@@ -40,3 +40,26 @@ export interface OperationSummary {
   parent_count: number;
   clock: string[];
 }
+
+export interface PairingBundle {
+  db_id: string;
+  salt: string;
+  device_id: string;
+  approver_public_key: string;
+  signature: string;
+  json: string;
+}
+
+export interface DiscoveredPeer {
+  device_id: string;
+  public_key: string;
+  sync_addr: string;
+}
+
+export interface MergeEntry {
+  key: string;
+  winner_device_id: string;
+  winner_value: string;
+  loser_device_ids: string[];
+  resolved_at: string;
+}

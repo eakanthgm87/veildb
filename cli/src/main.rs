@@ -21,6 +21,10 @@ struct Cli {
     #[arg(short, long, default_value = "veildb.vdb")]
     db: PathBuf,
 
+    /// Passphrase (non-interactive). Use only for scripts and tests.
+    #[arg(long)]
+    passphrase: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -46,10 +50,21 @@ enum Command {
         /// The backend to use.
         #[arg(long, default_value = "lan")]
         backend: String,
-        /// The peer address (for LAN backend).
+        /// The peer address (for LAN backend), or bind address with --listen.
         #[arg(long)]
         addr: Option<String>,
+        /// Accept one incoming connection instead of dialing.
+        #[arg(long)]
+        listen: bool,
     },
+    /// Discover peers on the LAN via UDP multicast.
+    Discover {
+        /// How long to listen for announcements (ms).
+        #[arg(long, default_value = "2000")]
+        timeout_ms: u64,
+    },
+    /// Show the merge log (deterministic conflict resolutions).
+    Merges,
     /// Verify database integrity.
     Verify,
     /// Show the operation log.
@@ -101,6 +116,16 @@ enum DeviceAction {
         /// The device ID (hex, 64 chars).
         device_id: String,
     },
+    /// Export a pairing bundle for a new device.
+    ExportPairing {
+        /// Output file for the JSON bundle.
+        output: PathBuf,
+    },
+    /// Import a pairing bundle and approve the inviting device.
+    ImportPairing {
+        /// JSON bundle file.
+        file: PathBuf,
+    },
     /// Rotate the master key.
     RotateKey,
 }
@@ -122,11 +147,15 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    // Make the passphrase available to open_core/init_core helpers.
+    PASSPHRASE.with(|p| *p.borrow_mut() = cli.passphrase.clone());
     match cli.command {
         Command::Init => cmd_init(&cli.db),
         Command::Put { key, value } => cmd_put(&cli.db, &key, value.as_bytes()),
         Command::Get { key } => cmd_get(&cli.db, &key),
-        Command::Sync { backend, addr } => cmd_sync(&cli.db, &backend, addr),
+        Command::Sync { backend, addr, listen } => cmd_sync(&cli.db, &backend, addr, listen),
+        Command::Discover { timeout_ms } => cmd_discover(&cli.db, timeout_ms),
+        Command::Merges => cmd_merges(&cli.db),
         Command::Verify => cmd_verify(&cli.db),
         Command::Log { at } => cmd_log(&cli.db, at),
         Command::Device { action } => cmd_device(&cli.db, action),
@@ -138,7 +167,15 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
+thread_local! {
+    /// Optional passphrase supplied via --passphrase (scripts/tests).
+    static PASSPHRASE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
 fn prompt_passphrase() -> Result<SecretString> {
+    if let Some(p) = PASSPHRASE.with(|p| p.borrow().clone()) {
+        return Ok(SecretString::new(p));
+    }
     let passphrase = rpassword::prompt_password("Enter passphrase: ")
         .context("Failed to read passphrase")?;
     Ok(SecretString::new(passphrase))
@@ -186,19 +223,37 @@ fn cmd_get(db: &PathBuf, key: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_sync(db: &PathBuf, backend: &str, addr: Option<String>) -> Result<()> {
+fn cmd_sync(db: &PathBuf, backend: &str, addr: Option<String>, listen: bool) -> Result<()> {
     let mut core = open_core(db)?;
+    let addr_opt = addr.clone();
     let backend_kind = match backend {
         "mock" => SyncBackendKind::Mock,
         "lan" => {
-            let addr = addr.ok_or_else(|| anyhow!("--addr is required for LAN backend"))?;
-            SyncBackendKind::Lan { addr }
+            let addr = addr_opt
+                .clone()
+                .ok_or_else(|| anyhow!("--addr is required for LAN backend"))?;
+            if listen {
+                SyncBackendKind::Listen { addr }
+            } else {
+                SyncBackendKind::Lan { addr }
+            }
         }
         other => return Err(anyhow!("Unknown backend: {other}")),
     };
 
     let rt = tokio::runtime::Runtime::new()?;
-    let report = rt.block_on(core.sync(backend_kind))?;
+    let report = if listen {
+        let bind_addr = addr
+            .clone()
+            .ok_or_else(|| anyhow!("--addr is required for --listen"))?;
+        rt.block_on(core.sync_listen_once_with(&bind_addr, || {
+            println!("listening on {bind_addr}");
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+        }))?
+    } else {
+        rt.block_on(core.sync(backend_kind))?
+    };
     println!("Sync report:");
     println!("  Received: {} ops", report.operations_received);
     println!("  Sent: {} ops", report.operations_sent);
@@ -206,6 +261,48 @@ fn cmd_sync(db: &PathBuf, backend: &str, addr: Option<String>) -> Result<()> {
     println!("  Merkle root: {}", hex(&report.merkle_root));
     println!("  Status: {}", if report.success { "OK" } else { "FAILED" });
     println!("  Message: {}", report.message);
+    Ok(())
+}
+
+fn cmd_discover(db: &PathBuf, timeout_ms: u64) -> Result<()> {
+    let core = open_core(db)?;
+    let rt = tokio::runtime::Runtime::new()?;
+    let peers = rt.block_on(core.discover_peers(timeout_ms))?;
+    if peers.is_empty() {
+        println!("No peers discovered.");
+        return Ok(());
+    }
+    println!("Discovered {} peer(s):", peers.len());
+    for p in &peers {
+        println!(
+            "  {} @ {} (key {})",
+            hex(&p.device_id),
+            p.sync_addr,
+            hex_short(&p.public_key)
+        );
+    }
+    Ok(())
+}
+
+fn cmd_merges(db: &PathBuf) -> Result<()> {
+    let core = open_core(db)?;
+    let entries = core.merge_log()?;
+    if entries.is_empty() {
+        println!("No merge-log entries recorded.");
+        return Ok(());
+    }
+    println!("{:<20} {:<22} {:<22} {:<28}", "Key", "Winner", "Loser", "Rule");
+    for e in &entries {
+        println!(
+            "{:<20} {:<22} {:<22} {:<28}",
+            e.key,
+            format!("{}.{}", hex_short(&e.winner.device_id), e.winner.sequence),
+            e.loser
+                .map(|l| format!("{}.{}", hex_short(&l.device_id), l.sequence))
+                .unwrap_or_else(|| "-".to_string()),
+            e.rule,
+        );
+    }
     Ok(())
 }
 
@@ -284,6 +381,23 @@ fn cmd_device(db: &PathBuf, action: DeviceAction) -> Result<()> {
             let id = parse_hex(&device_id)?;
             core.revoke_device(&id)?;
             println!("Device revoked: {}", hex(&id));
+            Ok(())
+        }
+        DeviceAction::ExportPairing { output } => {
+            let bundle = core.export_pairing()?;
+            std::fs::write(&output, bundle.to_json()?)?;
+            println!("Pairing bundle written: {}", output.display());
+            println!("  DB ID: {}", hex(&bundle.db_id));
+            println!("  Approver device: {}", hex(&bundle.device_id));
+            Ok(())
+        }
+        DeviceAction::ImportPairing { file } => {
+            let json = std::fs::read_to_string(&file)?;
+            let bundle = veildb_core::PairingBundle::from_json(&json)?;
+            let entry = core.import_pairing(&bundle)?;
+            println!("Pairing bundle imported and device approved:");
+            println!("  Device ID: {}", hex(&entry.device_id));
+            println!("  Public key: {}", hex_short(&entry.public_key));
             Ok(())
         }
         DeviceAction::RotateKey => {

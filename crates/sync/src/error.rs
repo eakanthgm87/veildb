@@ -64,6 +64,10 @@ pub enum SyncError {
     /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// The feature or subsystem is not implemented yet.
+    #[error("Not implemented: {0}")]
+    NotImplemented(String),
 }
 
 impl From<postcard::Error> for SyncError {

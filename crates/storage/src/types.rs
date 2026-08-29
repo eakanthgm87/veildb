@@ -179,6 +179,28 @@ impl std::fmt::Debug for SecretString {
     }
 }
 
+/// A persisted record of one deterministic CRDT conflict resolution.
+///
+/// Written after a sync merge when two or more operations touched the
+/// same logical key. Identical (key, winner, loser) triples are only
+/// ever recorded once, so the log is idempotent across repeated syncs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeLogEntry {
+    /// Row ID of the merge-log entry.
+    pub id: i64,
+    /// The logical key the conflicting operations wrote to.
+    pub key: String,
+    /// The operation that deterministically won.
+    pub winner: OperationId,
+    /// The operation that lost, if a single loser could be identified.
+    pub loser: Option<OperationId>,
+    /// The resolution rule applied ("causal-dominance" or
+    /// "concurrent-device-tiebreak").
+    pub rule: String,
+    /// Unix timestamp of when the entry was recorded.
+    pub created_at: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

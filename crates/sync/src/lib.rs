@@ -11,6 +11,7 @@
 //! No timestamp-based conflict resolution is used. Operations are
 //! identified by (device_id, sequence_number) which is globally unique.
 
+pub mod discovery;
 pub mod error;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -268,7 +269,7 @@ impl LanBackend {
         let bytes = postcard::to_allocvec(message)?;
         let len = (bytes.len() as u32).to_le_bytes();
         use tokio::io::AsyncWriteExt;
-        let mut stream = &mut self.stream;
+        let stream = &mut self.stream;
         stream.write_all(&len).await.map_err(|e| SyncError::Io(e))?;
         stream
             .write_all(&bytes)
@@ -280,7 +281,7 @@ impl LanBackend {
 
     async fn read_message(&mut self) -> Result<SyncMessage, SyncError> {
         use tokio::io::AsyncReadExt;
-        let mut stream = &mut self.stream;
+        let stream = &mut self.stream;
         let mut len_buf = [0u8; 4];
         stream
             .read_exact(&mut len_buf)
@@ -422,6 +423,58 @@ impl CrdtEngine {
     }
 }
 
+/// Live trust lookup.
+///
+/// Implemented by the core layer over the device registry in storage.
+/// Because the check happens at sync time against the live registry,
+/// a `revoke_device` call takes effect immediately, even for sessions
+/// that were already possible a moment ago.
+pub trait TrustProvider: Send + Sync {
+    /// Whether the device is currently trusted (not revoked).
+    fn is_trusted(&self, device_id: &[u8; 32]) -> bool;
+
+    /// The stored Ed25519 public key for a device, if known.
+    ///
+    /// Used to verify operation signatures in protocol step 9.
+    fn public_key_of(&self, device_id: &[u8; 32]) -> Option<[u8; 32]>;
+}
+
+/// A static, in-memory [`TrustProvider`].
+///
+/// Useful for tests and as a default; production code should use the
+/// storage-backed provider from the core layer so revocations are
+/// honored immediately.
+pub struct StaticTrustProvider {
+    trusted: HashSet<[u8; 32]>,
+    public_keys: HashMap<[u8; 32], [u8; 32]>,
+}
+
+impl StaticTrustProvider {
+    /// Build a provider from a set of trusted device IDs.
+    pub fn new(trusted: HashSet<[u8; 32]>) -> Self {
+        Self {
+            trusted,
+            public_keys: HashMap::new(),
+        }
+    }
+
+    /// Associate a known public key with a device.
+    pub fn with_public_key(mut self, device_id: [u8; 32], public_key: [u8; 32]) -> Self {
+        self.public_keys.insert(device_id, public_key);
+        self
+    }
+}
+
+impl TrustProvider for StaticTrustProvider {
+    fn is_trusted(&self, device_id: &[u8; 32]) -> bool {
+        self.trusted.contains(device_id)
+    }
+
+    fn public_key_of(&self, device_id: &[u8; 32]) -> Option<[u8; 32]> {
+        self.public_keys.get(device_id).copied()
+    }
+}
+
 /// The sync engine.
 ///
 /// Orchestrates the 14-step sync protocol using a backend transport.
@@ -431,8 +484,8 @@ pub struct SyncEngine<S: StorageEngine> {
     signing: Arc<SigningKeyPair>,
     /// The database ID.
     db_id: [u8; 32],
-    /// The set of trusted device IDs.
-    trusted_devices: HashSet<[u8; 32]>,
+    /// Live trust lookup (so revocations take effect immediately).
+    trust: Arc<dyn TrustProvider>,
 }
 
 impl<S: StorageEngine> SyncEngine<S> {
@@ -441,13 +494,13 @@ impl<S: StorageEngine> SyncEngine<S> {
         storage: S,
         signing: Arc<SigningKeyPair>,
         db_id: [u8; 32],
-        trusted_devices: HashSet<[u8; 32]>,
+        trust: Arc<dyn TrustProvider>,
     ) -> Self {
         Self {
             storage,
             signing,
             db_id,
-            trusted_devices,
+            trust,
         }
     }
 
@@ -491,7 +544,7 @@ impl<S: StorageEngine> SyncEngine<S> {
             SyncMessage::Hello {
                 protocol_version,
                 device_id: _,
-                public_key,
+                public_key: _,
                 nonce,
             } => {
                 if *protocol_version != SYNC_PROTOCOL_VERSION {
@@ -553,7 +606,10 @@ impl<S: StorageEngine> SyncEngine<S> {
         };
 
         // Step 2: Verify device trust.
-        if !self.trusted_devices.contains(&peer_device_id) {
+        //
+        // The check is live: the provider consults the device registry
+        // at this instant, so a concurrent revoke_device takes effect.
+        if !self.trust.is_trusted(&peer_device_id) {
             return Err(SyncError::PeerNotTrusted(peer_device_id));
         }
 
@@ -600,7 +656,7 @@ impl<S: StorageEngine> SyncEngine<S> {
             .send(SyncMessage::MerkleRoot { root: local_root })
             .await?;
 
-        let peer_root = match backend.receive().await? {
+        let _peer_root = match backend.receive().await? {
             SyncMessage::MerkleRoot { root } => root,
             SyncMessage::Error { message } => {
                 return Err(SyncError::InvalidPeerMessage(message.clone()));
@@ -618,7 +674,6 @@ impl<S: StorageEngine> SyncEngine<S> {
         // concurrently. Each side then computes which of its own ops
         // the peer is missing and sends those in step 7.
         let local_hashes: Vec<[u8; 32]> = local_ops.iter().map(operation_hash).collect();
-        let local_hash_set: HashSet<[u8; 32]> = local_hashes.iter().copied().collect();
 
         // Send our hashes so the peer can compute the diff.
         backend
@@ -679,18 +734,21 @@ impl<S: StorageEngine> SyncEngine<S> {
         }
 
         // Step 9: Verify signatures.
-        // Each operation's signature must verify against the
-        // device's public key. We look up the device's public key
-        // from the trusted devices set. Since we only have device IDs
-        // in the trusted set, we verify the signature against the
-        // device's public key from the operation's device_id.
-        // In a full implementation, the access layer provides the
-        // public key lookup. Here we verify the signature is present
-        // and non-empty.
+        //
+        // Operations are signed over the operation hash computed with
+        // an empty signature field (see core's append path). Here we
+        // recompute that hash for each peer operation and verify the
+        // Ed25519 signature against the device's stored public key.
         for op in &peer_ops {
-            if op.signature.is_empty() {
-                return Err(SyncError::SignatureVerificationFailed);
-            }
+            let public_key = self
+                .trust
+                .public_key_of(&op.device_id)
+                .ok_or(SyncError::SignatureVerificationFailed)?;
+            let mut unsigned = op.clone();
+            unsigned.signature = vec![];
+            let op_hash = operation_hash(&unsigned);
+            verify_signature(&public_key, &op_hash, &op.signature)
+                .map_err(|_| SyncError::SignatureVerificationFailed)?;
         }
 
         // Step 10: Validate operation graph.
@@ -702,7 +760,7 @@ impl<S: StorageEngine> SyncEngine<S> {
 
         // Step 11: CRDT merge.
         let merged = CrdtEngine::merge(&local_ops, &peer_ops)?;
-        let merged_count = merged.len() as u64;
+        let _merged_count = merged.len() as u64;
 
         // Step 12: Apply atomically.
         // Append all new operations.
@@ -885,19 +943,33 @@ mod tests {
         let signing_b = Arc::new(SigningKeyPair::generate());
         let device_b_id = veildb_crypto::hash(&signing_b.public_key());
 
-        // Add an operation to device A.
-        let op_a = test_op(device_a_id, 1, vec![]);
+        // Add a signed operation to device A.
+        let op_a = {
+            let mut op = test_op(device_a_id, 1, vec![]);
+            op.signature = vec![];
+            let op_hash = operation_hash(&op);
+            op.signature = signing_a.sign(&op_hash);
+            op
+        };
         let mut storage_a = storage_a;
         storage_a.append(op_a).unwrap();
 
-        // Trust each other.
-        let trusted_a: HashSet<[u8; 32]> = vec![device_b_id].into_iter().collect();
-        let trusted_b: HashSet<[u8; 32]> = vec![device_a_id].into_iter().collect();
+        // Trust each other (live provider with known public keys).
+        let trust_a: Arc<dyn TrustProvider> = Arc::new(
+            StaticTrustProvider::new(vec![device_b_id].into_iter().collect())
+                .with_public_key(device_a_id, signing_a.public_key())
+                .with_public_key(device_b_id, signing_b.public_key()),
+        );
+        let trust_b: Arc<dyn TrustProvider> = Arc::new(
+            StaticTrustProvider::new(vec![device_a_id].into_iter().collect())
+                .with_public_key(device_a_id, signing_a.public_key())
+                .with_public_key(device_b_id, signing_b.public_key()),
+        );
 
         let db_id = [0x42u8; 32];
 
-        let mut engine_a = SyncEngine::new(storage_a, signing_a, db_id, trusted_a);
-        let mut engine_b = SyncEngine::new(storage_b, signing_b, db_id, trusted_b);
+        let mut engine_a = SyncEngine::new(storage_a, signing_a, db_id, trust_a);
+        let mut engine_b = SyncEngine::new(storage_b, signing_b, db_id, trust_b);
 
         let (mut backend_a, mut backend_b) = MockBackend::pair();
 

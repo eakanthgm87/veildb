@@ -19,7 +19,6 @@ pub mod error;
 pub use veildb_integrity::IntegrityStatus;
 pub use veildb_storage::{LogicalClock, SecretString};
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -29,11 +28,88 @@ use veildb_crypto::{SigningKeyPair, X25519KeyPair, Ciphertext, derive_key, decry
 use veildb_integrity::{operation_hash, verify_operations};
 use veildb_query::{DbState, OperationSummary, QueryEngine, build_log};
 use veildb_storage::{
-    Operation, OperationId, SqliteStorage, StorageEngine,
+    MergeLogEntry, Operation, OperationId, SqliteStorage, StorageEngine,
 };
-use veildb_sync::{SyncEngine, SyncReport};
+use veildb_sync::{
+    LanBackend, SyncBackend, SyncEngine, SyncReport, TrustProvider,
+    discovery::DiscoveredPeer,
+};
 
 use error::CoreError;
+
+/// A storage-backed [`TrustProvider`].
+///
+/// Every trust query hits the live device registry in SQLite, so
+/// approvals and revocations are honored on the next handshake
+/// without restarting the sync engine.
+pub struct LiveTrustProvider {
+    /// A dedicated read connection to the same database. Mutex-wrapped
+    /// because `SqliteStorage` is not `Sync`.
+    storage: std::sync::Mutex<SqliteStorage>,
+}
+
+impl TrustProvider for LiveTrustProvider {
+    fn is_trusted(&self, device_id: &[u8; 32]) -> bool {
+        let storage = self.storage.lock().expect("trust provider poisoned");
+        storage
+            .load_device(device_id)
+            .ok()
+            .flatten()
+            .map(|d| d.trusted)
+            .unwrap_or(false)
+    }
+
+    fn public_key_of(&self, device_id: &[u8; 32]) -> Option<[u8; 32]> {
+        let storage = self.storage.lock().expect("trust provider poisoned");
+        storage
+            .load_device(device_id)
+            .ok()
+            .flatten()
+            .and_then(|d| {
+                if d.public_key.len() == 32 {
+                    let mut pk = [0u8; 32];
+                    pk.copy_from_slice(&d.public_key);
+                    Some(pk)
+                } else {
+                    None
+                }
+            })
+    }
+}
+
+/// A signed pairing bundle exchanged out-of-band between devices.
+///
+/// The existing (approving) device exports it; the joining device
+/// verifies it, approves the approver's key locally, and — if its own
+/// database is still empty — adopts the bundle's database identity
+/// (db_id) and KDF salt. The data key itself never travels: it is
+/// derived on the joining device from the shared passphrase and the
+/// adopted salt, exactly as on the originating device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingBundle {
+    /// The database ID being joined.
+    pub db_id: [u8; 32],
+    /// The KDF salt used to derive the data key from the passphrase.
+    pub salt: [u8; 32],
+    /// The approver's device ID.
+    pub device_id: [u8; 32],
+    /// The approver's Ed25519 public key.
+    pub approver_public_key: [u8; 32],
+    /// Ed25519 signature over `db_id || approver_public_key`.
+    pub signature: Vec<u8>,
+}
+
+impl PairingBundle {
+    /// Serialize to pretty JSON for file or QR transport.
+    pub fn to_json(&self) -> Result<String, CoreError> {
+        serde_json::to_string_pretty(self).map_err(|e| CoreError::Serialization(e.to_string()))
+    }
+
+    /// Parse from JSON.
+    pub fn from_json(json: &str) -> Result<Self, CoreError> {
+        serde_json::from_str(json).map_err(|e| CoreError::Serialization(e.to_string()))
+    }
+}
 
 /// The current database format version.
 pub const DB_FORMAT_VERSION: u32 = 1;
@@ -117,6 +193,8 @@ pub enum SyncBackendKind {
     Mock,
     /// LAN backend (TCP).
     Lan { addr: String },
+    /// Accept one incoming TCP connection (LAN listener).
+    Listen { addr: String },
     /// Cloud relay (stub).
     #[cfg(feature = "sync-cloud")]
     Cloud,
@@ -215,53 +293,69 @@ impl VeilDbCore {
         let signing: Arc<SigningKeyPair>;
         let x25519: Arc<X25519KeyPair>;
 
-        if exists {
+        // Try to load previously stored (encrypted) keypairs.
+        let stored: Option<(SigningKeyPair, X25519KeyPair)> = if exists {
             let signing_ct = storage.get_metadata(META_SIGNING_KEY)?;
             let x25519_ct = storage.get_metadata(META_X25519_KEY)?;
 
-            if let (Some(sk_bytes), Some(xk_bytes)) = (signing_ct, x25519_ct) {
-                if !sk_bytes.is_empty() && !xk_bytes.is_empty() {
+            match (signing_ct, x25519_ct) {
+                (Some(sk_bytes), Some(xk_bytes))
+                    if !sk_bytes.is_empty() && !xk_bytes.is_empty() =>
+                {
                     let sk_ct: Ciphertext = postcard::from_bytes(&sk_bytes)
                         .map_err(|e| CoreError::Serialization(e.to_string()))?;
                     let xk_ct: Ciphertext = postcard::from_bytes(&xk_bytes)
                         .map_err(|e| CoreError::Serialization(e.to_string()))?;
 
-                    let sk_secret = decrypt(&master_key, &sk_ct)
-                        .map_err(|e| CoreError::Crypto(e))?;
-                    let xk_secret = decrypt(&master_key, &xk_ct)
-                        .map_err(|e| CoreError::Crypto(e))?;
+                    let sk_secret =
+                        decrypt(&master_key, &sk_ct).map_err(|e| CoreError::Crypto(e))?;
+                    let xk_secret =
+                        decrypt(&master_key, &xk_ct).map_err(|e| CoreError::Crypto(e))?;
 
-                    let mut sk_arr = [0u8; 32];
-                    sk_arr.copy_from_slice(&sk_secret);
-                    let mut xk_arr = [0u8; 32];
-                    xk_arr.copy_from_slice(&xk_secret);
-
-                    signing = Arc::new(SigningKeyPair::from_seed(sk_arr));
-                    x25519 = Arc::new(X25519KeyPair::from_seed(xk_arr));
-                } else {
-                    signing = Arc::new(SigningKeyPair::generate());
-                    x25519 = Arc::new(X25519KeyPair::generate());
+                    if sk_secret.len() == 32 && xk_secret.len() == 32 {
+                        let mut sk_arr = [0u8; 32];
+                        sk_arr.copy_from_slice(&sk_secret);
+                        let mut xk_arr = [0u8; 32];
+                        xk_arr.copy_from_slice(&xk_secret);
+                        Some((
+                            SigningKeyPair::from_seed(sk_arr),
+                            X25519KeyPair::from_seed(xk_arr),
+                        ))
+                    } else {
+                        None
+                    }
                 }
-            } else {
-                signing = Arc::new(SigningKeyPair::generate());
-                x25519 = Arc::new(X25519KeyPair::generate());
+                _ => None,
             }
         } else {
-            signing = Arc::new(SigningKeyPair::generate());
-            x25519 = Arc::new(X25519KeyPair::generate());
+            None
+        };
 
-            let sk_ct = encrypt(&master_key, key_version, signing.secret_bytes().as_ref())
-                .map_err(|e| CoreError::Crypto(e))?;
-            let xk_ct = encrypt(&master_key, key_version, &x25519.secret_bytes())
-                .map_err(|e| CoreError::Crypto(e))?;
+        match stored {
+            Some((sk, xk)) => {
+                signing = Arc::new(sk);
+                x25519 = Arc::new(xk);
+            }
+            None => {
+                // Generate fresh keypairs and persist them under the
+                // current master key so the identity is stable across
+                // opens (also the post-adoption path after pairing).
+                signing = Arc::new(SigningKeyPair::generate());
+                x25519 = Arc::new(X25519KeyPair::generate());
 
-            let sk_bytes = postcard::to_allocvec(&sk_ct)
-                .map_err(|e| CoreError::Serialization(e.to_string()))?;
-            let xk_bytes = postcard::to_allocvec(&xk_ct)
-                .map_err(|e| CoreError::Serialization(e.to_string()))?;
+                let sk_ct = encrypt(&master_key, key_version, signing.secret_bytes().as_ref())
+                    .map_err(|e| CoreError::Crypto(e))?;
+                let xk_ct = encrypt(&master_key, key_version, &x25519.secret_bytes())
+                    .map_err(|e| CoreError::Crypto(e))?;
 
-            storage.set_metadata(META_SIGNING_KEY, &sk_bytes)?;
-            storage.set_metadata(META_X25519_KEY, &xk_bytes)?;
+                let sk_bytes = postcard::to_allocvec(&sk_ct)
+                    .map_err(|e| CoreError::Serialization(e.to_string()))?;
+                let xk_bytes = postcard::to_allocvec(&xk_ct)
+                    .map_err(|e| CoreError::Serialization(e.to_string()))?;
+
+                storage.set_metadata(META_SIGNING_KEY, &sk_bytes)?;
+                storage.set_metadata(META_X25519_KEY, &xk_bytes)?;
+            }
         }
 
         // Create the access engine.
@@ -287,20 +381,16 @@ impl VeilDbCore {
             key_version,
         );
 
-        // Build the trusted devices set.
-        let devices = access.list_devices()?;
-        let trusted: HashSet<[u8; 32]> = devices
-            .iter()
-            .filter(|d| d.trusted)
-            .map(|d| d.device_id)
-            .collect();
-
-        // Create the sync engine.
+        // Create the sync engine with a live, storage-backed trust
+        // provider: trust is evaluated against the device registry at
+        // sync time, so revoke_device takes effect immediately.
         let sync_engine = SyncEngine::new(
             SqliteStorage::open(path)?, // separate connection for sync
             signing.clone(),
             db_id,
-            trusted,
+            Arc::new(LiveTrustProvider {
+                storage: std::sync::Mutex::new(SqliteStorage::open(path)?),
+            }),
         );
 
         Ok(Self {
@@ -435,7 +525,7 @@ impl VeilDbCore {
         backend: SyncBackendKind,
     ) -> Result<SyncReport, CoreError> {
         // Construct the backend.
-        match backend {
+        let report = match backend {
             SyncBackendKind::Mock => {
                 // For Mock, we can't actually sync. Return a default report.
                 return Ok(SyncReport {
@@ -450,21 +540,34 @@ impl VeilDbCore {
             }
             SyncBackendKind::Lan { addr } => {
                 let mut backend = veildb_sync::LanBackend::connect(&addr).await?;
-                Ok(self.sync.sync(&mut backend).await?)
+                let report = self.sync.sync(&mut backend).await?;
+                backend.close().await?;
+                report
+            }
+            SyncBackendKind::Listen { addr } => {
+                self.sync_listen_once(&addr).await?
             }
             #[cfg(feature = "sync-cloud")]
             SyncBackendKind::Cloud => {
-                return Err(CoreError::Serialization(
-                    "Cloud backend not yet implemented".to_string(),
+                return Err(CoreError::Sync(
+                    veildb_sync::error::SyncError::NotImplemented(
+                        "cloud backend not yet implemented".to_string(),
+                    ),
                 ));
             }
             #[cfg(feature = "sync-p2p")]
             SyncBackendKind::P2p => {
-                return Err(CoreError::Serialization(
-                    "P2P backend not yet implemented".to_string(),
+                return Err(CoreError::Sync(
+                    veildb_sync::error::SyncError::NotImplemented(
+                        "P2P backend not yet implemented".to_string(),
+                    ),
                 ));
             }
-        }
+        };
+
+        // Record any deterministic conflict resolutions from this sync.
+        self.record_merge_log()?;
+        Ok(report)
     }
 
     /// Trust a new device by its public key.
@@ -490,18 +593,201 @@ impl VeilDbCore {
         id.copy_from_slice(device_id);
         self.access.revoke_device(&id)?;
 
-        // Update the sync engine's trusted devices.
-        let devices = self.access.list_devices()?;
-        let _trusted: HashSet<[u8; 32]> = devices
-            .iter()
-            .filter(|d| d.trusted)
-            .map(|d| d.device_id)
-            .collect();
-        // Note: We can't easily recreate the sync engine here since
-        // the signing keypair doesn't implement Clone. In a production
-        // system, we'd restructure this. For now, we leave the sync
-        // engine as-is and rely on per-call trust verification.
+        // No snapshot update needed: the sync engine consults the
+        // live device registry through `LiveTrustProvider` at every
+        // handshake, so the revocation takes effect immediately.
         Ok(())
+    }
+
+    /// Export a pairing bundle for a new device.
+    ///
+    /// The bundle is a signed, JSON-serialized invitation containing
+    /// this database's ID and the approver's public key. The joining
+    /// device presents it via [`VeilDbCore::import_pairing`] to be
+    /// approved into the trust registry.
+    pub fn export_pairing(&self) -> Result<PairingBundle, CoreError> {
+        let public_key = self.signing.public_key();
+        let salt: [u8; 32] = match self.storage.get_metadata(META_SALT)? {
+            Some(bytes) if bytes.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                arr
+            }
+            _ => {
+                return Err(CoreError::Serialization(
+                    "database salt missing".to_string(),
+                ))
+            }
+        };
+        let mut msg = Vec::with_capacity(96);
+        msg.extend_from_slice(&self.db_id);
+        msg.extend_from_slice(&salt);
+        msg.extend_from_slice(&public_key);
+        let signature = self.signing.sign(&msg);
+
+        Ok(PairingBundle {
+            db_id: self.db_id,
+            salt,
+            device_id: veildb_crypto::hash(&public_key),
+            approver_public_key: public_key,
+            signature,
+        })
+    }
+
+    /// Import a pairing bundle: approve the inviting device's key into
+    /// our local trust registry so we can sync with it.
+    ///
+    /// The bundle's signature is verified against the embedded
+    /// approver public key before the device is approved.
+    pub fn import_pairing(&mut self, bundle: &PairingBundle) -> Result<TrustEntry, CoreError> {
+        // Verify the bundle binds to the claimed approver key.
+        let mut msg = Vec::with_capacity(96);
+        msg.extend_from_slice(&bundle.db_id);
+        msg.extend_from_slice(&bundle.salt);
+        msg.extend_from_slice(&bundle.approver_public_key);
+        veildb_crypto::verify_signature(
+            &bundle.approver_public_key,
+            &msg,
+            &bundle.signature,
+        )
+        .map_err(|_| CoreError::Serialization("invalid pairing bundle signature".to_string()))?;
+
+        // If this device's database is still empty AND it belongs to a
+        // different database (i.e. this is the joining device), adopt
+        // the inviting database's identity (db_id and KDF salt) so the
+        // data key derives identically from the shared passphrase on
+        // the next open. The originating device keeps its identity.
+        if self.db_id != bundle.db_id && self.storage.operation_count()? == 0 {
+            self.storage.set_metadata(META_DB_ID, &bundle.db_id)?;
+            self.storage.set_metadata(META_SALT, &bundle.salt)?;
+            // Discard the per-device key material encrypted under the
+            // old (pre-adoption) data key; fresh keys are generated
+            // and stored under the new key on the next open.
+            self.storage.delete_metadata(META_SIGNING_KEY)?;
+            self.storage.delete_metadata(META_X25519_KEY)?;
+        }
+
+        self.access.approve_device(&bundle.approver_public_key)?;
+
+        // Return the resulting trust entry for the approved device.
+        let entry = self
+            .access
+            .list_devices()?
+            .into_iter()
+            .find(|d| d.public_key == bundle.approver_public_key.to_vec())
+            .ok_or_else(|| {
+                CoreError::Serialization("approved device not found in registry".to_string())
+            })?;
+        Ok(entry)
+    }
+
+    /// Run one sync session with a peer over TCP (client side).
+    pub async fn sync_with_peer(&mut self, addr: &str) -> Result<SyncReport, CoreError> {
+        let mut backend = LanBackend::connect(addr).await?;
+        let report = self.sync.sync(&mut backend).await?;
+        backend.close().await?;
+        self.record_merge_log()?;
+        Ok(report)
+    }
+
+    /// Accept one incoming TCP sync session (server side).
+    pub async fn sync_listen_once(&mut self, addr: &str) -> Result<SyncReport, CoreError> {
+        self.sync_listen_once_with(addr, || {}).await
+    }
+
+    /// Like [`VeilDbCore::sync_listen_once`], but invokes `ready`
+    /// (e.g. to announce readiness) after the listener is bound and
+    /// before accepting the peer connection.
+    pub async fn sync_listen_once_with<F>(
+        &mut self,
+        addr: &str,
+        ready: F,
+    ) -> Result<SyncReport, CoreError>
+    where
+        F: FnOnce(),
+    {
+        let listener = LanBackend::listen(addr).await?;
+        ready();
+        let mut backend = LanBackend::accept(&listener).await?;
+        let report = self.sync.sync(&mut backend).await?;
+        backend.close().await?;
+        self.record_merge_log()?;
+        Ok(report)
+    }
+
+    /// Bind a TCP listener for sync and announce it via UDP multicast
+    /// discovery, then accept one incoming session.
+    pub async fn sync_listen(
+        &mut self,
+        addr: &str,
+        sync_port: u16,
+        beacon_interval_ms: u64,
+    ) -> Result<SyncReport, CoreError> {
+        let _beacon = veildb_sync::discovery::spawn_beacon(
+            self.signing.clone(),
+            self.db_id,
+            sync_port,
+            std::time::Duration::from_millis(beacon_interval_ms),
+        )
+        .await?;
+
+        self.sync_listen_once(addr).await
+    }
+
+    /// Discover peers on the LAN via UDP multicast for `timeout_ms`.
+    pub async fn discover_peers(&self, timeout_ms: u64) -> Result<Vec<DiscoveredPeer>, CoreError> {
+        let peers = veildb_sync::discovery::discover(
+            std::time::Duration::from_millis(timeout_ms),
+            self.db_id,
+        )
+        .await?;
+        Ok(peers)
+    }
+
+    /// Query the persistent merge log (deterministic CRDT conflict
+    /// resolutions recorded during sync).
+    pub fn merge_log(&self) -> Result<Vec<MergeLogEntry>, CoreError> {
+        Ok(self.storage.list_merge_entries()?)
+    }
+
+    /// Compute deterministic conflict resolutions over the current
+    /// operation set and persist any not already recorded.
+    ///
+    /// Idempotent: identical (key, winner, loser) triples are stored
+    /// once. Returns the entries that were newly recorded.
+    pub fn record_merge_log(&mut self) -> Result<Vec<MergeLogEntry>, CoreError> {
+        let ops = self.storage.read_all_operations()?;
+        let outcomes = self.query.resolve_conflicts(&ops)?;
+
+        let mut recorded = Vec::new();
+        for outcome in outcomes {
+            let loser = outcome.loser;
+            if self
+                .storage
+                .merge_entry_exists(&outcome.key, &outcome.winner, loser.as_ref())?
+            {
+                continue;
+            }
+            let entry = MergeLogEntry {
+                id: 0,
+                key: outcome.key.clone(),
+                winner: outcome.winner,
+                loser,
+                rule: outcome.rule.as_str().to_string(),
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+            };
+            self.storage.record_merge_entry(
+                &entry.key,
+                entry.winner,
+                entry.loser,
+                &entry.rule,
+            )?;
+            recorded.push(entry);
+        }
+        Ok(recorded)
     }
 
     /// Share a key with a target device.
