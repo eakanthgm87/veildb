@@ -925,6 +925,12 @@ impl VeilDbCore {
          different key). Open a FRESH EMPTY database on one of the devices and run Sync \
          again — the empty one will automatically join the other.";
 
+    /// Message emitted by the GUI background listener when another sync
+    /// session holds the core lock. The dialing side treats this as
+    /// retryable and retries a few times before giving up.
+    pub const MSG_PEER_BUSY: &str = "This peer is already busy with another sync right now \
+         — try again in a moment.";
+
     /// One-click sync.
     ///
     /// Pass `None` (or an empty string) to discover peers on the LAN
@@ -966,10 +972,58 @@ impl VeilDbCore {
             }
         };
 
+        // Dial with retry: the remote peer may briefly be busy with
+        // another sync (its GUI listener rejects the probe with
+        // `MSG_PEER_BUSY` while a session holds its core lock). Instead
+        // of surfacing a permanent failure for a transient condition,
+        // retry a few times with a short backoff.
+        const MAX_SYNC_ATTEMPTS: u32 = 3;
+        const RETRY_DELAY_MS: u64 = 1000;
+
+        let mut last_error: Option<CoreError> = None;
+        for attempt in 0..MAX_SYNC_ATTEMPTS {
+            match Self::try_sync_once(self, &target, discovered.clone()).await {
+                Ok(report) => return Ok(report),
+                Err(e) => {
+                    let msg = e.to_string();
+                    let is_transient = msg.contains(Self::MSG_PEER_BUSY)
+                        || msg.contains("busy")
+                        || msg.contains("Connection reset")
+                        || msg.contains("connection reset")
+                        || msg.contains("ConnectionReset")
+                        || msg.contains("Aborted")
+                        || msg.contains("os error 54")
+                        || msg.contains("os error 10053")
+                        || msg.contains("os error 10061")
+                        || msg.contains("Connection refused");
+                    if !is_transient {
+                        return Err(e);
+                    }
+                    last_error = Some(e);
+                    if attempt + 1 < MAX_SYNC_ATTEMPTS {
+                        tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            CoreError::Serialization(format!("sync with {target} failed after multiple attempts"))
+        }))
+    }
+
+    /// One outbound sync attempt: dial the peer and run the pairing
+    /// probe → sync session. Used by [`Self::sync_auto`] which wraps
+    /// this in a retry loop for transient failures.
+    async fn try_sync_once(
+        &mut self,
+        target: &str,
+        discovered: Vec<DiscoveredPeerInfo>,
+    ) -> Result<AutoSyncReport, CoreError> {
         // Dial with a bounded connect timeout so the UI never hangs.
         let stream = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            tokio::net::TcpStream::connect(&target),
+            tokio::net::TcpStream::connect(target),
         )
         .await
         .map_err(|_| CoreError::Serialization(format!("connect to {target} timed out")))?
@@ -979,7 +1033,7 @@ impl VeilDbCore {
             ))
         })?;
 
-        self.run_outbound_session(stream, &target, discovered).await
+        self.run_outbound_session(stream, target, discovered).await
     }
 
     /// Listen on `addr`, accept ONE inbound session, and serve it
@@ -2169,7 +2223,7 @@ mod tests {
         // Restore into a fresh database.
         let restore_path = dir.path().join("restore.vdb");
         let passphrase = SecretString::new("test-passphrase".to_string());
-        let mut restored = VeilDbCore::init(&restore_path, passphrase).unwrap();
+        let restored = VeilDbCore::init(&restore_path, passphrase).unwrap();
 
         // Set the same DB ID so restore works.
         // In practice, restore would be into the same DB. Here we
@@ -2195,6 +2249,86 @@ mod tests {
         let blob = core.share("shared", &entry.device_id).unwrap();
         assert_eq!(blob.to_device, entry.device_id);
         assert_eq!(blob.key, "shared");
+        drop(dir);
+    }
+
+    /// The dialer must retry when the peer answers with the busy
+    /// message (instead of failing permanently). The server here
+    /// always answers `MSG_PEER_BUSY`; we assert the dialer tried more
+    /// than once and finally surfaced the busy error rather than a
+    /// raw OS connection error.
+    #[tokio::test]
+    async fn sync_dialer_retries_when_peer_busy() {
+        use veildb_sync::LanBackend;
+        use veildb_sync::SyncBackend;
+        use veildb_sync::SyncMessage;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // A server that measures how many times the dialer tried.
+        let server_handle = tokio::spawn(async move {
+            let mut connections = 0u32;
+            // Accept up to 4 connections (MAX_SYNC_ATTEMPTS = 3, plus
+            // slack); each is rejected with the busy message.
+            for _ in 0..4 {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    listener.accept(),
+                )
+                .await
+                {
+                    Ok(Ok((stream, _))) => {
+                        connections += 1;
+                        let mut backend = LanBackend::from_stream(stream);
+                        let _ =
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                backend.receive(),
+                            )
+                            .await;
+                        backend
+                            .send(SyncMessage::Error {
+                                message: VeilDbCore::MSG_PEER_BUSY.to_string(),
+                            })
+                            .await
+                            .ok();
+                        backend.close().await.ok();
+                    }
+                    _ => break,
+                }
+            }
+            connections
+        });
+
+        let (dir, mut core) = test_core();
+        let result = core
+            .sync_auto(Some(addr.to_string()))
+            .await;
+
+        let connections = server_handle.await.unwrap();
+
+        // The dialer must have retried at least twice even though the
+        // peer is (simulated) busy.
+        assert!(
+            connections >= 2,
+            "expected the dialer to retry on a busy peer, but it only made {connections} attempt(s)"
+        );
+
+        // And the final error should mention the busy condition, not a
+        // cryptic OS error.
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("busy"),
+                    "expected a busy-related error, got: {msg}"
+                );
+            }
+            Ok(r) => panic!("expected a busy failure, got success: {r:?}"),
+        }
         drop(dir);
     }
 }

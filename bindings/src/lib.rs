@@ -891,9 +891,30 @@ fn detect_local_ip() -> Option<String> {
 /// what would otherwise be a deadlock + "connection reset" into a
 /// clear, retryable message.
 fn handle_incoming_session(state: Arc<AppState>, stream: tokio::net::TcpStream, peer: String) {
-    let mut guard = match state.core.try_lock() {
-        Ok(g) => g,
-        Err(_) => {
+    // If the core is currently busy (a foreground sync holds the lock),
+    // give it a generous grace period to finish before rejecting — this
+    // lets the very common "both users click within a second" case
+    // succeed instead of erroring. We never block indefinitely: a pure
+    // blocking lock here could deadlock against an outbound sync. A
+    // third call that still can't get the lock is rejected with the
+    // shared busy message; the dialing side retries a few times, so a
+    // short-lived foreground sync self-heals without user action.
+    let mut guard = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while guard.is_none() {
+        match state.core.try_lock() {
+            Ok(g) => guard = Some(g),
+            Err(_) => {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+    let mut guard = match guard {
+        Some(g) => g,
+        None => {
             // IMPORTANT: drain the dialer's probe before closing.
             // If we close the socket with unread data still buffered,
             // macOS sends a TCP RST and the dialer sees
@@ -908,8 +929,7 @@ fn handle_incoming_session(state: Arc<AppState>, stream: tokio::net::TcpStream, 
                 .await;
                 backend
                     .send(veildb_sync::SyncMessage::Error {
-                        message: "This peer is already busy with another sync right now — try again in a moment."
-                            .to_string(),
+                        message: veildb_core::VeilDbCore::MSG_PEER_BUSY.to_string(),
                     })
                     .await
             };

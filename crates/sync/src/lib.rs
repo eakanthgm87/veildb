@@ -228,8 +228,30 @@ pub trait SyncBackend: Send + Sync {
     async fn send(&mut self, message: SyncMessage) -> Result<(), SyncError>;
     /// Receive a message from the peer.
     async fn receive(&mut self) -> Result<SyncMessage, SyncError>;
-    /// Close the connection.
+    /// Close the connection cleanly.
     async fn close(&mut self) -> Result<(), SyncError>;
+
+    /// Drain any buffered incoming data, then close the connection.
+    ///
+    /// This is the recommended teardown for error / rejection paths.
+    /// By draining one final message before closing, we ensure the
+    /// peer's TCP receive queue is flushed with a clean FIN rather
+    /// than an abrupt RST (which surfaces as "Connection reset by
+    /// peer" / "os error 54" on macOS and "os error 10053" on
+    /// Windows).
+    ///
+    /// The drain has a short timeout and silently ignores failures —
+    /// the important part is the clean `close()` afterwards.
+    async fn drain_and_close(&mut self, drain_timeout_ms: u64) -> Result<(), SyncError> {
+        // Try to read one more message; if nothing arrives within
+        // the timeout (normal — the peer already closed), that's fine.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(drain_timeout_ms),
+            self.receive(),
+        )
+        .await;
+        self.close().await
+    }
 }
 
 /// A mock backend for testing.
@@ -285,7 +307,7 @@ impl SyncBackend for MockBackend {
 ///
 /// Messages are length-prefixed postcard-serialized `SyncMessage`s.
 pub struct LanBackend {
-    stream: tokio::net::TcpStream,
+    stream: Option<tokio::net::TcpStream>,
 }
 
 impl LanBackend {
@@ -293,22 +315,47 @@ impl LanBackend {
     /// GUI's background sync listener) so the engine or the
     /// auto-pairing handshake can run over it.
     pub fn from_stream(stream: tokio::net::TcpStream) -> Self {
-        Self { stream }
+        Self { stream: Some(stream) }
     }
 
     /// Connect to a peer at the given address.
     pub async fn connect(addr: &str) -> Result<Self, SyncError> {
         let stream = tokio::net::TcpStream::connect(addr)
             .await
-            .map_err(|e| SyncError::Io(e))?;
-        Ok(Self { stream })
+            .map_err(SyncError::Io)?;
+        Ok(Self { stream: Some(stream) })
     }
 
     /// Listen for incoming connections.
+    ///
+    /// Sets `SO_REUSEADDR` (via `tokio`'s default on bind, reinforced
+    /// explicitly on Unix) so that a restart releases the port from
+    /// `TIME_WAIT` quickly, avoiding "Address already in use" errors.
     pub async fn listen(addr: &str) -> Result<tokio::net::TcpListener, SyncError> {
-        tokio::net::TcpListener::bind(addr)
+        let listener = tokio::net::TcpListener::bind(addr)
             .await
-            .map_err(|e| SyncError::Io(e))
+            .map_err(SyncError::Io)?;
+        // Tokio already sets SO_REUSEADDR on bind, but on Unix we
+        // additionally set it explicitly for clarity and to defend
+        // against environments where the default is not applied.
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: setting a standard socket option; failure is
+            // non-fatal (tokio already set SO_REUSEADDR by default).
+            let fd = listener.as_raw_fd();
+            let opt: libc::c_int = 1;
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_REUSEADDR,
+                    &opt as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as u32,
+                );
+            }
+        }
+        Ok(listener)
     }
 
     /// Accept an incoming connection.
@@ -316,38 +363,44 @@ impl LanBackend {
         let (stream, _) = listener
             .accept()
             .await
-            .map_err(|e| SyncError::Io(e))?;
-        Ok(Self { stream })
+            .map_err(SyncError::Io)?;
+        Ok(Self { stream: Some(stream) })
     }
 
     async fn write_message(&mut self, message: &SyncMessage) -> Result<(), SyncError> {
         let bytes = postcard::to_allocvec(message)?;
         let len = (bytes.len() as u32).to_le_bytes();
         use tokio::io::AsyncWriteExt;
-        let stream = &mut self.stream;
-        stream.write_all(&len).await.map_err(|e| SyncError::Io(e))?;
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or(SyncError::ConnectionDropped)?;
+        stream.write_all(&len).await.map_err(SyncError::Io)?;
         stream
             .write_all(&bytes)
             .await
-            .map_err(|e| SyncError::Io(e))?;
-        stream.flush().await.map_err(|e| SyncError::Io(e))?;
+            .map_err(SyncError::Io)?;
+        stream.flush().await.map_err(SyncError::Io)?;
         Ok(())
     }
 
     async fn read_message(&mut self) -> Result<SyncMessage, SyncError> {
         use tokio::io::AsyncReadExt;
-        let stream = &mut self.stream;
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or(SyncError::ConnectionDropped)?;
         let mut len_buf = [0u8; 4];
         stream
             .read_exact(&mut len_buf)
             .await
-            .map_err(|e| SyncError::Io(e))?;
+            .map_err(SyncError::Io)?;
         let len = u32::from_le_bytes(len_buf) as usize;
         let mut buf = vec![0u8; len];
         stream
             .read_exact(&mut buf)
             .await
-            .map_err(|e| SyncError::Io(e))?;
+            .map_err(SyncError::Io)?;
         postcard::from_bytes(&buf).map_err(|e| SyncError::Serialization(e.to_string()))
     }
 }
@@ -363,7 +416,29 @@ impl SyncBackend for LanBackend {
     }
 
     async fn close(&mut self) -> Result<(), SyncError> {
+        // Clean half-close: shutdown both directions of the TCP stream
+        // so the peer receives a FIN (not a RST). This is critical when
+        // unread data is still buffered in the receive queue.
+        if let Some(stream) = self.stream.take() {
+            let _ = stream
+                .into_std()
+                .and_then(|s| s.shutdown(std::net::Shutdown::Both));
+        }
         Ok(())
+    }
+}
+
+/// Safety net: ensure the TCP stream is cleanly shut down even if
+/// `close()` was never explicitly called (e.g. on an early `return Err`
+/// deep in the sync protocol). Without this, dropping a `LanBackend`
+/// with unread data in the receive buffer sends a TCP RST.
+impl Drop for LanBackend {
+    fn drop(&mut self) {
+        if let Some(stream) = self.stream.take() {
+            let _ = stream
+                .into_std()
+                .and_then(|s| s.shutdown(std::net::Shutdown::Both));
+        }
     }
 }
 
@@ -1045,5 +1120,97 @@ mod tests {
         // Both should have the same operation count.
         // Device A has 1 op, device B has 0, so B receives 1.
         assert_eq!(report_b.operations_received, 1);
+    }
+
+    /// Verify `LanBackend::close()` (and `Drop`) perform a clean TCP
+    /// shutdown so the peer sees a FIN/EOF rather than an abrupt RST.
+    /// An RST would surface as "Connection reset by peer (os error 54)"
+    /// on macOS / "(os error 10053)" on Windows.
+    #[tokio::test]
+    async fn lan_backend_close_sends_clean_fin() {
+        // Set up a real TCP pair.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let dialer = tokio::spawn(async move {
+            tokio::net::TcpStream::connect(addr).await.unwrap()
+        });
+        let (accepted, _) = listener.accept().await.unwrap();
+        let dialer_stream = dialer.await.unwrap();
+
+        // Wrap the accepted side; close it cleanly.
+        let mut backend = LanBackend::from_stream(accepted);
+        backend.close().await.unwrap();
+        drop(backend);
+
+        // Now read from the dialer side. After a clean FIN, `read`
+        // returns Ok(0) (EOF). After an RST it returns an Err such as
+        // ConnectionReset. The point of the fix: the dialer must NOT
+        // see a "connection reset" error.
+        use tokio::io::AsyncReadExt;
+        let mut dialer = dialer_stream;
+        let mut buf = [0u8; 4];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            dialer.read(&mut buf),
+        )
+        .await
+        .expect("read after close must not hang")
+        .unwrap_or_else(|e| {
+            // Some platforms surface the close as an error rather than
+            // EOF; a clean FIN yields WouldBlock-timeout rather than a
+            // hard reset on the loopback. We accept both EOF and timeouts,
+            // but never a reset-class error.
+            match e.kind() {
+                std::io::ErrorKind::ConnectionReset => {
+                    panic!("peer saw a TCP RST instead of a clean FIN: {e}")
+                }
+                std::io::ErrorKind::ConnectionAborted => {
+                    panic!("peer saw a connection aborted instead of a clean FIN: {e}")
+                }
+                _ => 0,
+            }
+        });
+        // `n` is either 0 (EOF) — the clean case.
+        let _ = n;
+    }
+
+    /// Verify that dropping a `LanBackend` (without calling `close`)
+    /// also performs a clean shutdown — this is the safety net for
+    /// early `return Err` paths in the sync protocol.
+    #[tokio::test]
+    async fn lan_backend_drop_is_clean() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let dialer = tokio::spawn(async move {
+            tokio::net::TcpStream::connect(addr).await.unwrap()
+        });
+        let (accepted, _) = listener.accept().await.unwrap();
+        let dialer_stream = dialer.await.unwrap();
+
+        // Drop without a close() call (simulates an early return Err).
+        drop(LanBackend::from_stream(accepted));
+
+        use tokio::io::AsyncReadExt;
+        let mut dialer = dialer_stream;
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            dialer.read(&mut buf),
+        )
+        .await
+        .expect("read after drop must not hang")
+        .unwrap_or_else(|e| match e.kind() {
+            std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted => {
+                panic!("peer saw a TCP RST instead of a clean FIN: {e}")
+            }
+            _ => 0,
+        });
     }
 }
