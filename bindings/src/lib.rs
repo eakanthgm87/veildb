@@ -884,8 +884,32 @@ fn detect_local_ip() -> Option<String> {
 /// Runs inside `spawn_blocking`: the core mutex is held for the whole
 /// session (same as a foreground `vdb_sync_now`), which serializes
 /// concurrent sessions but keeps command handlers safe.
+///
+/// If the core is already locked (this machine is itself mid-sync as
+/// the dialer, or two peers clicked Sync at the same instant), we do
+/// NOT block forever — we reply with a clean error instead. That turns
+/// what would otherwise be a deadlock + "connection reset" into a
+/// clear, retryable message.
 fn handle_incoming_session(state: Arc<AppState>, stream: tokio::net::TcpStream, peer: String) {
-    let mut guard = state.core.lock().unwrap();
+    let mut guard = match state.core.try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            let send_busy = async {
+                let mut backend = veildb_sync::LanBackend::from_stream(stream);
+                backend
+                    .send(veildb_sync::SyncMessage::Error {
+                        message: "This peer is already busy with another sync right now — try again in a moment."
+                            .to_string(),
+                    })
+                    .await
+            };
+            let _ = runtime().block_on(send_busy);
+            append_log(&format!(
+                "sync session from {peer} rejected: another sync is in progress on this peer"
+            ));
+            return;
+        }
+    };
     match guard.as_mut() {
         None => {
             let send_err = async {

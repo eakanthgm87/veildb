@@ -432,7 +432,16 @@ function App() {
         }
       } else {
         const msg = result.error?.message || "Sync failed";
-        if (msg.includes("refused") || msg.includes("10061") || msg.includes("connection")) {
+        if (
+          msg.includes("reset by peer") ||
+          msg.includes("broken pipe") ||
+          msg.includes("No database is open") ||
+          msg.includes("older version")
+        ) {
+          // These are NOT fire-and-forget connection failures: the peer
+          // accepted the TCP connection, so the fault is on their side.
+          setError(msg);
+        } else if (msg.includes("refused") || msg.includes("10061") || msg.includes("connection")) {
           setError(`Could not connect to peer at ${syncAddr}. Make sure VeilDB is running with the database OPEN on the peer, then try again.`);
         } else {
           setError(msg);
@@ -440,7 +449,14 @@ function App() {
       }
     } catch (e: any) {
       const msg = e.message || String(e);
-      if (msg.includes("refused") || msg.includes("10061") || msg.includes("connection")) {
+      if (
+        msg.includes("reset by peer") ||
+        msg.includes("broken pipe") ||
+        msg.includes("No database is open") ||
+        msg.includes("older version")
+      ) {
+        setError(msg);
+      } else if (msg.includes("refused") || msg.includes("10061") || msg.includes("connection")) {
         setError(`Could not connect to peer at ${syncAddr}. Make sure VeilDB is running with the database OPEN on the peer, then try again.`);
       } else {
         setError(msg);

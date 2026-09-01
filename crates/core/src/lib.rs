@@ -1052,6 +1052,20 @@ impl VeilDbCore {
             SyncMessage::Error { message } => {
                 return Err(CoreError::Serialization(format!("peer error: {message}")));
             }
+            // An OLD dialer starts the legacy engine with `Hello`.
+            SyncMessage::Hello { .. } => {
+                let _ = backend
+                    .send(SyncMessage::Error {
+                        message: "This device runs the new one-click sync protocol, but the \
+                                  connecting device is running an older version. Update VeilDB \
+                                  on that device."
+                            .to_string(),
+                    })
+                    .await;
+                return Err(CoreError::Serialization(
+                    "peer is running an older version of VeilDB".to_string(),
+                ));
+            }
             _ => {
                 let _ = backend
                     .send(SyncMessage::Error {
@@ -1126,15 +1140,34 @@ impl VeilDbCore {
 
         let ack = match tokio::time::timeout(Self::PAIR_MSG_TIMEOUT, backend.receive()).await {
             Ok(Ok(m)) => m,
-            Ok(Err(e)) => return Err(e.into()),
+            Ok(Err(e)) => {
+                return Err(CoreError::Serialization(format!(
+                    "failed to reach a compatible peer at {target}: {e}. The other device may be \
+                     running an older version of VeilDB, its firewall may be blocking port 8443, \
+                     or its app may have no database open."
+                )));
+            }
             Err(_) => {
-                return Err(CoreError::Serialization(
-                    "timed out waiting for peer reply".to_string(),
-                ));
+                return Err(CoreError::Serialization(format!(
+                    "timed out waiting for {target} to answer. The peer may be running an older \
+                     version of VeilDB or its firewall may be blocking the connection."
+                )));
             }
         };
 
         let (peer_db, peer_dev, _peer_pub, peer_ops, nonce_r) = match ack {
+            // An OLD VeilDB build opens the 14-step engine protocol with
+            // a `Hello` and cannot parse our `PairProbe`. Detect that
+            // so we can tell the user to update the peer instead of
+            // surfacing a cryptic "connection reset".
+            SyncMessage::Hello { .. } => {
+                return Err(CoreError::Serialization(
+                    "The peer is running an OLDER version of VeilDB (it answered with the \
+                     legacy sync protocol). Update VeilDB on the other device to use one-click \
+                     LAN sync."
+                        .to_string(),
+                ));
+            }
             SyncMessage::PairProbeAck {
                 protocol_version,
                 db_id,
