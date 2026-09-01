@@ -262,6 +262,38 @@ function mockSyncLan(addr: string): any {
   };
 }
 
+function mockSyncNow(addr?: string): any {
+  requireMock();
+  mock!.lastSync = new Date().toISOString();
+  const merged = mock!.operations.length;
+  return {
+    peer_addr: addr ?? "",
+    peer_device_id: randomHex(64),
+    paired: false,
+    adopted: false,
+    discovered: mock!.discoveredPeers,
+    success: true,
+    message: addr
+      ? "Sync completed successfully"
+      : "No peers found on this simulated network — enter an IP address to sync with a real device.",
+    operations_received: 0,
+    operations_sent: merged,
+    operations_merged: 0,
+    merkle_root: mock!.merkleRoot,
+  };
+}
+
+function mockSyncInfo(): any {
+  requireMock();
+  return {
+    sync_port: 8443,
+    listening: true,
+    beacon_running: mock!.path != null,
+    db_open: mock!.path != null,
+    local_ip: "127.0.0.1",
+  };
+}
+
 function mockSyncListen(addr: string): any {
   requireMock();
   mock!.lastSync = new Date().toISOString();
@@ -483,6 +515,10 @@ async function call<T>(cmd: string, args: Record<string, unknown>): Promise<ApiR
         return ok(mockSnapshot() as T);
       case "vdb_sync_lan":
         return ok(mockSyncLan(args.addr as string) as T);
+      case "vdb_sync_now":
+        return ok(mockSyncNow(args.addr as string | undefined) as T);
+      case "vdb_sync_info":
+        return ok(mockSyncInfo() as T);
       case "vdb_sync_listen":
         return ok(mockSyncListen(args.addr as string) as T);
       case "vdb_export_pairing":
@@ -536,6 +572,8 @@ export const api = {
   restore: (archive: string) => call<any>("vdb_restore", { archive }),
   snapshot: () => call<number>("vdb_snapshot", {}),
   syncLan: (addr: string) => call<any>("vdb_sync_lan", { addr }),
+  syncNow: (addr?: string | null) => call<any>("vdb_sync_now", { addr }),
+  syncInfo: () => call<any>("vdb_sync_info", {}),
   syncListen: (addr: string) => call<any>("vdb_sync_listen", { addr }),
   exportPairing: () => call<any>("vdb_export_pairing", {}),
   importPairing: (bundleJson: string) =>

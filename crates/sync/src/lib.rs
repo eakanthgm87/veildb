@@ -168,6 +168,54 @@ pub enum SyncMessage {
     Error {
         message: String,
     },
+    // ─── Auto-pairing extension (pre-sync, see core's sync_auto) ───
+    // These variants ride the same transport but are only exchanged
+    // BEFORE the 14-step engine protocol, by the one-click auto-sync
+    // paths. Appended last so existing variant discriminants (and
+    // therefore the wire format of the engine protocol) are stable.
+    /// Auto-pairing probe sent by the dialing (initiator) side.
+    PairProbe {
+        protocol_version: u32,
+        db_id: [u8; 32],
+        device_id: [u8; 32],
+        public_key: [u8; 32],
+        operation_count: u64,
+        nonce: [u8; 32],
+    },
+    /// Auto-pairing probe reply from the listening (responder) side.
+    PairProbeAck {
+        protocol_version: u32,
+        db_id: [u8; 32],
+        device_id: [u8; 32],
+        public_key: [u8; 32],
+        operation_count: u64,
+        /// The responder's fresh nonce.
+        nonce: [u8; 32],
+        /// Echo of the initiator's nonce (replay protection).
+        probe_nonce: [u8; 32],
+        /// Ed25519 signature over `public_key || probe_nonce || db_id`.
+        signature: Vec<u8>,
+    },
+    /// The keeper side offers its signed pairing bundle.
+    PairBundleOffer {
+        db_id: [u8; 32],
+        salt: [u8; 32],
+        device_id: [u8; 32],
+        approver_public_key: [u8; 32],
+        signature: Vec<u8>,
+    },
+    /// Proof of passphrase knowledge (and, for the adopter, its
+    /// post-adoption public key).
+    PairProof {
+        public_key: [u8; 32],
+        proof: [u8; 32],
+        adopted: bool,
+    },
+    /// Final pairing verdict.
+    PairDecision {
+        accepted: bool,
+        message: String,
+    },
 }
 
 /// A sync backend transport.
@@ -241,6 +289,13 @@ pub struct LanBackend {
 }
 
 impl LanBackend {
+    /// Wrap an already-connected TCP stream (e.g. accepted by the
+    /// GUI's background sync listener) so the engine or the
+    /// auto-pairing handshake can run over it.
+    pub fn from_stream(stream: tokio::net::TcpStream) -> Self {
+        Self { stream }
+    }
+
     /// Connect to a peer at the given address.
     pub async fn connect(addr: &str) -> Result<Self, SyncError> {
         let stream = tokio::net::TcpStream::connect(addr)

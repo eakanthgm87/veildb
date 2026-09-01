@@ -9,6 +9,7 @@ import type {
   PairingBundle,
   DiscoveredPeer,
   MergeEntry,
+  SyncInfo,
 } from "./types";
 
 type Tab =
@@ -99,8 +100,10 @@ function App() {
   // Merge log state.
   const [merges, setMerges] = useState<MergeEntry[]>([]);
 
-  // Sync peer address.
+  // Sync peer address (optional — empty = auto-discover).
   const [syncAddr, setSyncAddr] = useState("127.0.0.1:8443");
+  // Sync endpoint info for this machine.
+  const [syncInfo, setSyncInfo] = useState<SyncInfo | null>(null);
 
   // Developer mode toggle (React state only, not persisted).
   const [devMode, setDevMode] = useState(false);
@@ -403,28 +406,34 @@ function App() {
     setError(null);
     setSyncing(true);
     setSyncLog([]);
-    if (!syncAddr.trim()) {
-      setError("Enter a peer address (e.g. 127.0.0.1:8443)");
-      setSyncing(false);
-      return;
-    }
     try {
-      const result = await api.syncLan(syncAddr.trim());
+      // One-click: empty address = auto-discover + dial the first peer.
+      const addr = syncAddr.trim() || null;
+      const result = await api.syncNow(addr);
       if (result.success && result.data) {
-        setSyncLog([
-          `Sync completed: ${result.data.message}`,
-          `Received: ${result.data.operations_received} ops`,
-          `Sent: ${result.data.operations_sent} ops`,
-          `Merged: ${result.data.operations_merged} ops`,
-          `Merkle root: ${result.data.merkle_root}`,
-        ]);
-        refreshStatus();
-        refreshDag();
-        refreshMerkle();
+        const d = result.data;
+        if (d.success) {
+          const lines: string[] = [];
+          if (d.paired) lines.push(d.adopted ? "Auto-paired (joined the peer's database) + synced ✓" : "Auto-paired + synced ✓");
+          else lines.push(`Sync completed: ${d.message}`);
+          if (d.operations_received != null) lines.push(`Received: ${d.operations_received} ops`);
+          if (d.operations_sent != null) lines.push(`Sent: ${d.operations_sent} ops`);
+          if (d.operations_merged != null) lines.push(`Merged: ${d.operations_merged} ops`);
+          if (d.merkle_root) lines.push(`Merkle root: ${d.merkle_root}`);
+          lines.push("The other device also has a sync listener running, so no extra steps are needed.");
+          setSyncLog(lines);
+          refreshStatus();
+          refreshDag();
+          refreshMerkle();
+          refreshDevices();
+        } else {
+          // Auto-discovery found nothing, or databases are different.
+          setError(d.message || "Sync failed");
+        }
       } else {
         const msg = result.error?.message || "Sync failed";
         if (msg.includes("refused") || msg.includes("10061") || msg.includes("connection")) {
-          setError(`Could not connect to peer at ${syncAddr}. Make sure a VeilDB sync server is running on that address.`);
+          setError(`Could not connect to peer at ${syncAddr}. Make sure VeilDB is running with the database OPEN on the peer, then try again.`);
         } else {
           setError(msg);
         }
@@ -432,12 +441,23 @@ function App() {
     } catch (e: any) {
       const msg = e.message || String(e);
       if (msg.includes("refused") || msg.includes("10061") || msg.includes("connection")) {
-        setError(`Could not connect to peer at ${syncAddr}. Make sure a VeilDB sync server is running on that address.`);
+        setError(`Could not connect to peer at ${syncAddr}. Make sure VeilDB is running with the database OPEN on the peer, then try again.`);
       } else {
         setError(msg);
       }
     } finally {
       setSyncing(false);
+    }
+  }
+
+  async function handleSyncInfo() {
+    try {
+      const result = await api.syncInfo();
+      if (result.success && result.data) {
+        setSyncInfo(result.data);
+      }
+    } catch {
+      // Non-fatal: the sync tab still works without endpoint info.
     }
   }
 
@@ -574,6 +594,12 @@ function App() {
       refreshMerkle();
     }
   }, [status]);
+
+  // Refresh local sync endpoint info once on mount.
+  useEffect(() => {
+    handleSyncInfo();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // File picker for DB path.
   async function pickDbPath() {
@@ -859,6 +885,7 @@ function App() {
                   onSyncAddrChange={setSyncAddr}
                   onSync={handleSync}
                   onViewGraph={() => setActiveTab("graph")}
+                  syncInfo={syncInfo}
                   pairingBundle={pairingBundle}
                   pairingJson={pairingJson}
                   onPairingJsonChange={setPairingJson}
@@ -1230,6 +1257,7 @@ function Sync({
   onSyncAddrChange,
   onSync,
   onViewGraph,
+  syncInfo,
   pairingBundle,
   pairingJson,
   onPairingJsonChange,
@@ -1247,6 +1275,7 @@ function Sync({
   onSyncAddrChange: (v: string) => void;
   onSync: () => void;
   onViewGraph: () => void;
+  syncInfo?: SyncInfo | null;
   pairingBundle: PairingBundle | null;
   pairingJson: string;
   onPairingJsonChange: (v: string) => void;
@@ -1263,27 +1292,42 @@ function Sync({
       <h2 className="text-xl font-semibold">Sync</h2>
 
       <div className="bg-dark-800 border border-slate-700 rounded p-4">
-        <h3 className="text-lg font-medium mb-3">LAN Sync</h3>
+        <h3 className="text-lg font-medium mb-3">LAN Sync — one click</h3>
+        <p className="text-xs text-slate-400 mb-2">
+          VeilDB runs a background sync listener and broadcasts its
+          presence on the LAN automatically.{syncInfo ? " " : ""}
+          {syncInfo && (
+            <span className="text-emerald-400">
+              This device: {syncInfo.local_ip}:{syncInfo.sync_port}
+              {syncInfo.beacon_running ? " · beacon on" : " · beacon off"}
+            </span>
+          )}
+        </p>
         <div className="space-y-2">
           <div>
             <label className="block text-xs text-slate-400 mb-1">
-              Peer Address
+              Peer IP (leave empty to auto-discover on the LAN)
             </label>
             <input
               type="text"
               value={syncAddr}
               onChange={(e) => onSyncAddrChange(e.target.value)}
-              placeholder="127.0.0.1:8443"
+              placeholder="Leave empty to find peers automatically, or 192.168.1.106:8443"
               className="w-full bg-dark-900 border border-slate-600 rounded px-3 py-2 text-sm font-mono"
             />
           </div>
           <button
             onClick={onSync}
             disabled={syncing}
-            className="w-full bg-primary-600 hover:bg-primary-700 disabled:bg-slate-600 text-white rounded px-3 py-2 text-sm"
+            className="w-full bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-600 text-white rounded px-3 py-2 text-base font-semibold"
           >
-            {syncing ? "Syncing..." : "Sync with LAN peer"}
+            {syncing ? "Syncing…" : "⚡ Sync Data Now"}
           </button>
+          <p className="text-xs text-slate-500">
+            No listener setup needed on either device — pressing the button
+            discovers peers, pairs automatically (same passphrase), merges
+            with no conflicts, and converges both databases.
+          </p>
           <button
             onClick={onViewGraph}
             className="w-full bg-dark-700 hover:bg-dark-600 rounded px-3 py-2 text-sm"
@@ -1356,23 +1400,38 @@ function Sync({
                   className="flex items-center justify-between bg-dark-900 rounded border border-slate-700 p-2"
                 >
                   <div>
-                    <p className="text-xs font-mono">{hex(p.device_id)}</p>
+                    <p className="text-xs font-mono">
+                      {hex(p.device_id)}{" "}
+                      {p.same_db && (
+                        <span className="text-emerald-400">· same DB</span>
+                      )}
+                      {p.same_db === false && (
+                        <span className="text-amber-400">· auto-join</span>
+                      )}
+                    </p>
                     <p className="text-xs text-slate-400 font-mono">
                       {p.sync_addr}
                     </p>
                   </div>
                   <button
-                    onClick={() => onSyncAddrChange(p.sync_addr)}
-                    className="text-xs bg-dark-700 hover:bg-dark-600 px-2 py-1 rounded"
+                    onClick={() => {
+                      onSyncAddrChange(p.sync_addr);
+                      onSync();
+                    }}
+                    className="text-xs bg-primary-600 hover:bg-primary-700 px-2 py-1 rounded"
                   >
-                    Use
+                    Sync
                   </button>
                 </div>
               ))}
             </div>
           ) : (
             <p className="text-xs text-slate-400">
-              No peers discovered yet. Run discovery on the local network.
+              No peers found yet. Press "Sync Data Now" with an empty address
+              to auto-discover on the local network.
+              {syncInfo?.local_ip
+                ? ` Your IP: ${syncInfo.local_ip}:${syncInfo.sync_port}`
+                : ""}
             </p>
           )}
         </div>

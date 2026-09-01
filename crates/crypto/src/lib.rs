@@ -312,6 +312,38 @@ pub fn hash(data: &[u8]) -> [u8; 32] {
     *blake3::hash(data).as_bytes()
 }
 
+/// Domain-separation tag for the auto-pairing proof.
+const PAIRING_PROOF_DOMAIN: &[u8] = b"VEILDB-AUTO-PAIR-V1";
+
+/// Compute a proof-of-passphrase-knowledge for automatic pairing.
+///
+/// The proof is `BLAKE3(domain || secret || nonce_initiator ||
+/// nonce_responder || db_id_initiator || db_id_responder)`. Both
+/// peers compute the same input (both know both nonces and both
+/// ORIGINAL database IDs from the probe exchange, and the initiator
+/// role is unambiguous: the dialing side).
+///
+/// The proof proves to each side that the other holds the same
+/// passphrase without ever transmitting the passphrase or any key
+/// derived from it. A passive observer learns nothing reversible;
+/// an active attacker cannot forge a proof for a fresh nonce.
+pub fn pairing_proof(
+    secret: &[u8],
+    nonce_initiator: &[u8; 32],
+    nonce_responder: &[u8; 32],
+    db_initiator: &[u8; 32],
+    db_responder: &[u8; 32],
+) -> [u8; 32] {
+    let mut msg = Vec::with_capacity(PAIRING_PROOF_DOMAIN.len() + 32 * 4 + secret.len());
+    msg.extend_from_slice(PAIRING_PROOF_DOMAIN);
+    msg.extend_from_slice(secret);
+    msg.extend_from_slice(nonce_initiator);
+    msg.extend_from_slice(nonce_responder);
+    msg.extend_from_slice(db_initiator);
+    msg.extend_from_slice(db_responder);
+    hash(&msg)
+}
+
 /// Generate a random 32-byte value.
 pub fn random_bytes_32() -> [u8; 32] {
     let mut bytes = [0u8; 32];

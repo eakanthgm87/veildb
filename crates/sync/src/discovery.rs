@@ -108,6 +108,23 @@ pub fn decode_announcement(bytes: &[u8]) -> Result<PeerAnnouncement, SyncError> 
     postcard::from_bytes(bytes).map_err(|e| SyncError::Serialization(e.to_string()))
 }
 
+/// A verified discovery result, including the peer's database ID.
+///
+/// Unlike [`DiscoveredPeer`], this variant is returned regardless of
+/// which database the peer belongs to, so the one-click auto-sync can
+/// find (and pair with) peers that are not yet part of our database.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredPeerInfo {
+    /// The peer's device ID.
+    pub device_id: [u8; 32],
+    /// The peer's public key.
+    pub public_key: [u8; 32],
+    /// The database the peer currently belongs to.
+    pub db_id: [u8; 32],
+    /// The peer's address for TCP sync.
+    pub sync_addr: SocketAddr,
+}
+
 /// Listen for peer announcements on the multicast group for `timeout`
 /// and return every verified peer discovered in that window.
 ///
@@ -117,10 +134,25 @@ pub async fn discover(
     timeout: Duration,
     db_id: [u8; 32],
 ) -> Result<Vec<DiscoveredPeer>, SyncError> {
+    let all = discover_all(timeout).await?;
+    Ok(all
+        .into_iter()
+        .filter(|p| p.db_id == db_id)
+        .map(|p| DiscoveredPeer {
+            device_id: p.device_id,
+            public_key: p.public_key,
+            sync_addr: p.sync_addr,
+        })
+        .collect())
+}
+
+/// Listen for peer announcements on the multicast group for `timeout`
+/// and return every verified peer, regardless of database ID.
+pub async fn discover_all(timeout: Duration) -> Result<Vec<DiscoveredPeerInfo>, SyncError> {
     let socket = tokio::net::UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)).await?;
     socket.join_multicast_v4(DISCOVERY_GROUP, Ipv4Addr::UNSPECIFIED)?;
 
-    let mut peers: Vec<DiscoveredPeer> = Vec::new();
+    let mut peers: Vec<DiscoveredPeerInfo> = Vec::new();
     let deadline = tokio::time::Instant::now() + timeout;
 
     let mut buf = vec![0u8; 1024];
@@ -142,20 +174,16 @@ pub async fn discover(
             Err(_) => continue, // malformed: ignore
         };
 
-        // Ignore announcements for other databases.
-        if announcement.db_id != db_id {
-            continue;
-        }
-
         if validate_announcement(&announcement).is_err() {
             continue;
         }
 
         let sync_addr = SocketAddr::new(origin.ip(), announcement.sync_port);
         if !peers.iter().any(|p| p.device_id == announcement.device_id) {
-            peers.push(DiscoveredPeer {
+            peers.push(DiscoveredPeerInfo {
                 device_id: announcement.device_id,
                 public_key: announcement.public_key,
+                db_id: announcement.db_id,
                 sync_addr,
             });
         }

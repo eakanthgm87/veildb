@@ -6,40 +6,97 @@
 //! All errors crossing the Tauri boundary are serializable (`CoreError`
 //! → JSON). Never expose private/master keys, raw key material,
 //! SQLite connections, or internal storage structures across IPC.
-
 use std::path::PathBuf;
-use std::sync::Mutex;
-
+use std::sync::{Arc, Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
 use veildb_core::{
-    IntegrityStatus, LogicalClock, PairingBundle, SecretString, SyncBackendKind, VeilDbCore,
+    IntegrityStatus, LogicalClock, PairingBundle, SecretString, VeilDbCore,
 };
-
+use veildb_sync::SyncBackend;
+/// The TCP port the GUI's background sync listener binds to. Every
+/// VeilDB app instance on the LAN listens here, so a one-click sync
+/// never requires the peer to run any command.
+pub const SYNC_PORT: u16 = 8443;
+/// The discovery beacon interval.
+const BEACON_INTERVAL_MS: u64 = 1500;
+/// A shared tokio runtime for all async work (sync sessions, the
+/// background listener, the discovery beacon). Created lazily.
+pub fn runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| tokio::runtime::Runtime::new().expect("failed to create tokio runtime"))
+}
 /// The shared application state holding the core instance.
 pub struct AppState {
     /// The core instance (protected by a mutex for thread safety).
     core: Mutex<Option<VeilDbCore>>,
     /// The database path.
     db_path: Mutex<Option<PathBuf>>,
+    /// The passphrase used to open the current database (kept for
+    /// pairing operations; zeroized on drop).
+    passphrase: Mutex<Option<SecretString>>,
+    /// The running discovery beacon (shutdown sender + task handle).
+    beacon: Mutex<Option<(tokio::sync::mpsc::Sender<()>, tokio::task::JoinHandle<()>)>>,
 }
-
 impl AppState {
     /// Create a new empty app state.
     pub fn new() -> Self {
         Self {
             core: Mutex::new(None),
             db_path: Mutex::new(None),
+            passphrase: Mutex::new(None),
+            beacon: Mutex::new(None),
         }
     }
 }
-
 impl Default for AppState {
     fn default() -> Self {
         Self::new()
     }
 }
-
+/// Append a line to the debug log next to the executable.
+fn append_log(msg: &str) {
+    use std::io::Write;
+    let log_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("veildb-debug.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(f, "[{ts}] {msg}");
+    }
+}
+/// Stop the discovery beacon, if one is running.
+fn stop_beacon(state: &AppState) {
+    if let Some((tx, handle)) = state.beacon.lock().unwrap().take() {
+        let _ = tx.send(());
+        handle.abort();
+    }
+}
+/// (Re)start the discovery beacon for the currently open database so
+/// other devices can discover this machine with one click. No-op when
+/// no database is open.
+fn start_beacon(state: &AppState) {
+    stop_beacon(state);
+    let guard = state.core.lock().unwrap();
+    if let Some(core) = guard.as_ref() {
+        match runtime().block_on(core.spawn_discovery_beacon(SYNC_PORT, BEACON_INTERVAL_MS)) {
+            Ok(handle) => {
+                *state.beacon.lock().unwrap() = Some(handle);
+                append_log(&format!("discovery beacon started (sync port {SYNC_PORT})"));
+            }
+            Err(e) => append_log(&format!("failed to start discovery beacon: {e}")),
+        }
+    }
+}
 /// A serializable error response for the frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiError {
@@ -50,7 +107,6 @@ pub struct ApiError {
     /// Whether this is an integrity/tamper error.
     pub is_integrity: bool,
 }
-
 impl From<veildb_core::error::CoreError> for ApiError {
     fn from(e: veildb_core::error::CoreError) -> Self {
         let msg = e.to_string();
@@ -62,7 +118,6 @@ impl From<veildb_core::error::CoreError> for ApiError {
         }
     }
 }
-
 /// A successful response wrapper.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiResponse<T> {
@@ -73,7 +128,6 @@ pub struct ApiResponse<T> {
     /// The error (if failure).
     pub error: Option<ApiError>,
 }
-
 impl<T> ApiResponse<T> {
     /// Create a success response.
     pub fn ok(data: T) -> Self {
@@ -83,7 +137,6 @@ impl<T> ApiResponse<T> {
             error: None,
         }
     }
-
     /// Create an error response.
     pub fn err(e: impl Into<ApiError>) -> Self {
         Self {
@@ -93,15 +146,13 @@ impl<T> ApiResponse<T> {
         }
     }
 }
-
 // Command module to avoid macro scoping issues
 #[allow(dead_code)]
 mod commands {
     use super::*;
-
     #[tauri::command]
     pub fn vdb_init(
-        state: State<'_, AppState>,
+        state: State<'_, Arc<AppState>>,
         path: String,
         passphrase: String,
     ) -> ApiResponse<serde_json::Value> {
@@ -113,8 +164,7 @@ mod commands {
                 is_integrity: false,
             });
         }
-
-        let secret = SecretString::new(passphrase);
+        let secret = SecretString::new(passphrase.clone());
         match VeilDbCore::init(&path_buf, secret) {
             Ok(core) => {
                 let status = match core.status() {
@@ -124,6 +174,9 @@ mod commands {
                 let mut guard = state.core.lock().unwrap();
                 *guard = Some(core);
                 *state.db_path.lock().unwrap() = Some(path_buf);
+                *state.passphrase.lock().unwrap() = Some(SecretString::new(passphrase));
+                drop(guard);
+                start_beacon(&state);
                 ApiResponse::ok(serde_json::json!({
                     "db_id": hex(&status.db_id),
                     "device_id": hex(&status.self_device_id),
@@ -133,10 +186,9 @@ mod commands {
             Err(e) => ApiResponse::err(ApiError::from(e)),
         }
     }
-
     #[tauri::command]
     pub fn vdb_open(
-        state: State<'_, AppState>,
+        state: State<'_, Arc<AppState>>,
         path: String,
         passphrase: String,
     ) -> ApiResponse<serde_json::Value> {
@@ -148,8 +200,7 @@ mod commands {
                 is_integrity: false,
             });
         }
-
-        let secret = SecretString::new(passphrase);
+        let secret = SecretString::new(passphrase.clone());
         match VeilDbCore::init(&path_buf, secret) {
             Ok(core) => {
                 let status = match core.status() {
@@ -159,6 +210,9 @@ mod commands {
                 let mut guard = state.core.lock().unwrap();
                 *guard = Some(core);
                 *state.db_path.lock().unwrap() = Some(path_buf);
+                *state.passphrase.lock().unwrap() = Some(SecretString::new(passphrase));
+                drop(guard);
+                start_beacon(&state);
                 ApiResponse::ok(serde_json::json!({
                     "db_id": hex(&status.db_id),
                     "device_id": hex(&status.self_device_id),
@@ -168,18 +222,18 @@ mod commands {
             Err(e) => ApiResponse::err(ApiError::from(e)),
         }
     }
-
     #[tauri::command]
-    pub fn vdb_close(state: State<'_, AppState>) -> ApiResponse<()> {
+    pub fn vdb_close(state: State<'_, Arc<AppState>>) -> ApiResponse<()> {
+        stop_beacon(&state);
         let mut guard = state.core.lock().unwrap();
         *guard = None;
         *state.db_path.lock().unwrap() = None;
+        *state.passphrase.lock().unwrap() = None;
         ApiResponse::ok(())
     }
-
     #[tauri::command]
     pub fn vdb_put(
-        state: State<'_, AppState>,
+        state: State<'_, Arc<AppState>>,
         key: String,
         value: String,
     ) -> ApiResponse<serde_json::Value> {
@@ -196,9 +250,8 @@ mod commands {
             Err(e) => ApiResponse::err(ApiError::from(e)),
         }
     }
-
     #[tauri::command]
-    pub fn vdb_get(state: State<'_, AppState>, key: String) -> ApiResponse<String> {
+    pub fn vdb_get(state: State<'_, Arc<AppState>>, key: String) -> ApiResponse<String> {
         let guard = state.core.lock().unwrap();
         let core = guard.as_ref();
         let core = match core {
@@ -210,9 +263,8 @@ mod commands {
             Err(e) => ApiResponse::err(ApiError::from(e)),
         }
     }
-
     #[tauri::command]
-    pub fn vdb_status(state: State<'_, AppState>) -> ApiResponse<serde_json::Value> {
+    pub fn vdb_status(state: State<'_, Arc<AppState>>) -> ApiResponse<serde_json::Value> {
         let guard = state.core.lock().unwrap();
         let core = match guard.as_ref() {
             Some(c) => c,
@@ -238,9 +290,8 @@ mod commands {
             Err(e) => ApiResponse::err(ApiError::from(e)),
         }
     }
-
     #[tauri::command]
-    pub fn vdb_verify(state: State<'_, AppState>) -> ApiResponse<serde_json::Value> {
+    pub fn vdb_verify(state: State<'_, Arc<AppState>>) -> ApiResponse<serde_json::Value> {
         let guard = state.core.lock().unwrap();
         let core = match guard.as_ref() {
             Some(c) => c,
@@ -261,10 +312,9 @@ mod commands {
             Err(e) => ApiResponse::err(ApiError::from(e)),
         }
     }
-
     #[tauri::command]
     pub fn vdb_query_at(
-        state: State<'_, AppState>,
+        state: State<'_, Arc<AppState>>,
         clock: String,
     ) -> ApiResponse<serde_json::Value> {
         let guard = state.core.lock().unwrap();
@@ -302,9 +352,8 @@ mod commands {
             Err(e) => ApiResponse::err(ApiError::from(e)),
         }
     }
-
     #[tauri::command]
-    pub fn vdb_log(state: State<'_, AppState>) -> ApiResponse<serde_json::Value> {
+    pub fn vdb_log(state: State<'_, Arc<AppState>>) -> ApiResponse<serde_json::Value> {
         let mut guard = state.core.lock().unwrap();
         let core = match guard.as_mut() {
             Some(c) => c,
@@ -331,9 +380,8 @@ mod commands {
             Err(e) => ApiResponse::err(ApiError::from(e)),
         }
     }
-
     #[tauri::command]
-    pub fn vdb_list_devices(state: State<'_, AppState>) -> ApiResponse<serde_json::Value> {
+    pub fn vdb_list_devices(state: State<'_, Arc<AppState>>) -> ApiResponse<serde_json::Value> {
         let guard = state.core.lock().unwrap();
         let core = match guard.as_ref() {
             Some(c) => c,
@@ -358,10 +406,9 @@ mod commands {
             Err(e) => ApiResponse::err(ApiError::from(e)),
         }
     }
-
     #[tauri::command]
     pub fn vdb_trust_device(
-        state: State<'_, AppState>,
+        state: State<'_, Arc<AppState>>,
         public_key: String,
     ) -> ApiResponse<serde_json::Value> {
         let mut guard = state.core.lock().unwrap();
@@ -385,10 +432,9 @@ mod commands {
             Err(e) => ApiResponse::err(ApiError::from(e)),
         }
     }
-
     #[tauri::command]
     pub fn vdb_revoke_device(
-        state: State<'_, AppState>,
+        state: State<'_, Arc<AppState>>,
         device_id: String,
     ) -> ApiResponse<()> {
         let mut guard = state.core.lock().unwrap();
@@ -409,9 +455,8 @@ mod commands {
             Err(e) => ApiResponse::err(ApiError::from(e)),
         }
     }
-
     #[tauri::command]
-    pub fn vdb_backup(state: State<'_, AppState>, output: String) -> ApiResponse<serde_json::Value> {
+    pub fn vdb_backup(state: State<'_, Arc<AppState>>, output: String) -> ApiResponse<serde_json::Value> {
         let guard = state.core.lock().unwrap();
         let core = match guard.as_ref() {
             Some(c) => c,
@@ -427,9 +472,8 @@ mod commands {
             Err(e) => ApiResponse::err(ApiError::from(e)),
         }
     }
-
     #[tauri::command]
-    pub fn vdb_restore(state: State<'_, AppState>, archive: String) -> ApiResponse<()> {
+    pub fn vdb_restore(state: State<'_, Arc<AppState>>, archive: String) -> ApiResponse<()> {
         let mut guard = state.core.lock().unwrap();
         let core_ref = match guard.as_mut() {
             Some(c) => c,
@@ -440,9 +484,8 @@ mod commands {
             Err(e) => ApiResponse::err(ApiError::from(e)),
         }
     }
-
     #[tauri::command]
-    pub fn vdb_snapshot(state: State<'_, AppState>) -> ApiResponse<i64> {
+    pub fn vdb_snapshot(state: State<'_, Arc<AppState>>) -> ApiResponse<i64> {
         let mut guard = state.core.lock().unwrap();
         let core_ref = match guard.as_mut() {
             Some(c) => c,
@@ -453,40 +496,72 @@ mod commands {
             Err(e) => ApiResponse::err(ApiError::from(e)),
         }
     }
-
     #[tauri::command]
     pub fn vdb_sync_lan(
-        state: State<'_, AppState>,
+        state: State<'_, Arc<AppState>>,
         addr: String,
     ) -> ApiResponse<serde_json::Value> {
+        // Back-compat alias: the manual-address one-click sync.
+        vdb_sync_now(state, Some(addr))
+    }
+    /// One-click sync: dial the given address, or discover LAN peers
+    /// via UDP multicast when no address is given. Handles pairing
+    /// automatically (proof of shared passphrase + identity adoption
+    /// for an empty database) and then runs the CRDT sync.
+    #[tauri::command]
+    pub fn vdb_sync_now(
+        state: State<'_, Arc<AppState>>,
+        addr: Option<String>,
+    ) -> ApiResponse<serde_json::Value> {
         let mut guard = state.core.lock().unwrap();
-        let core_ref = match guard.as_mut() {
+        let core = match guard.as_mut() {
             Some(c) => c,
             None => return ApiResponse::err(not_initialized()),
         };
-        let backend = SyncBackendKind::Lan { addr };
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        match rt.block_on(core_ref.sync(backend)) {
-            Ok(report) => ApiResponse::ok(serde_json::json!({
-                "operations_received": report.operations_received,
-                "operations_sent": report.operations_sent,
-                "operations_merged": report.operations_merged,
-                "merkle_root": hex(&report.merkle_root),
-                "success": report.success,
-                "message": report.message,
+        match runtime().block_on(core.sync_auto(addr)) {
+            Ok(r) => ApiResponse::ok(serde_json::json!({
+                "peer_addr": r.peer_addr,
+                "peer_device_id": r.peer_device_id.map(|d| hex(&d)),
+                "paired": r.paired,
+                "adopted": r.adopted,
+                "discovered": r.discovered.iter().map(|p| serde_json::json!({
+                    "device_id": hex(&p.device_id),
+                    "public_key": hex(&p.public_key),
+                    "db_id": hex(&p.db_id),
+                    "sync_addr": p.sync_addr.to_string(),
+                })).collect::<Vec<_>>(),
+                "success": r.success,
+                "message": r.message,
+                "operations_received": r.report.as_ref().map(|x| x.operations_received),
+                "operations_sent": r.report.as_ref().map(|x| x.operations_sent),
+                "operations_merged": r.report.as_ref().map(|x| x.operations_merged),
+                "merkle_root": r.report.as_ref().map(|x| hex(&x.merkle_root)),
             })),
             Err(e) => ApiResponse::err(ApiError::from(e)),
         }
     }
-
+    /// Info about this machine's sync endpoint for the GUI (port,
+    /// listener + beacon status, best-effort LAN IP).
+    #[tauri::command]
+    pub fn vdb_sync_info(state: State<'_, Arc<AppState>>) -> ApiResponse<serde_json::Value> {
+        let beacon_running = state.beacon.lock().unwrap().is_some();
+        let db_open = state.core.lock().unwrap().is_some();
+        let local_ip = detect_local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
+        ApiResponse::ok(serde_json::json!({
+            "sync_port": SYNC_PORT,
+            "listening": true,
+            "beacon_running": beacon_running,
+            "db_open": db_open,
+            "local_ip": local_ip,
+        }))
+    }
     /// Accept ONE incoming TCP sync session (server / listen side).
     ///
-    /// Blocks until a peer connects and the handshake completes. Use
-    /// `vdb_sync_lan` on the dialing side.
+    /// Binds a temporary listener — the GUI normally relies on the
+    /// background listener started at app launch instead.
     #[tauri::command]
     pub fn vdb_sync_listen(
-        state: State<'_, AppState>,
+        state: State<'_, Arc<AppState>>,
         addr: String,
     ) -> ApiResponse<serde_json::Value> {
         let mut guard = state.core.lock().unwrap();
@@ -494,28 +569,28 @@ mod commands {
             Some(c) => c,
             None => return ApiResponse::err(not_initialized()),
         };
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        match rt.block_on(core_ref.sync_listen_once(&addr)) {
-            Ok(report) => ApiResponse::ok(serde_json::json!({
-                "operations_received": report.operations_received,
-                "operations_sent": report.operations_sent,
-                "operations_merged": report.operations_merged,
-                "merkle_root": hex(&report.merkle_root),
-                "success": report.success,
-                "message": report.message,
+        match runtime().block_on(core_ref.sync_listen_auto(&addr, || {})) {
+            Ok(r) => ApiResponse::ok(serde_json::json!({
+                "peer_addr": r.peer_addr,
+                "paired": r.paired,
+                "adopted": r.adopted,
+                "success": r.success,
+                "message": r.message,
+                "operations_received": r.report.as_ref().map(|x| x.operations_received),
+                "operations_sent": r.report.as_ref().map(|x| x.operations_sent),
+                "operations_merged": r.report.as_ref().map(|x| x.operations_merged),
+                "merkle_root": r.report.as_ref().map(|x| hex(&x.merkle_root)),
             })),
             Err(e) => ApiResponse::err(ApiError::from(e)),
         }
     }
-
     /// Export a signed pairing bundle for a new device.
     ///
     /// Returns the bundle as pretty JSON. The joining device presents
     /// it via `vdb_import_pairing`.
     #[tauri::command]
     pub fn vdb_export_pairing(
-        state: State<'_, AppState>,
+        state: State<'_, Arc<AppState>>,
     ) -> ApiResponse<serde_json::Value> {
         let guard = state.core.lock().unwrap();
         let core_ref = match guard.as_ref() {
@@ -540,7 +615,6 @@ mod commands {
             Err(e) => ApiResponse::err(ApiError::from(e)),
         }
     }
-
     /// Import a pairing bundle and approve the inviting device.
     ///
     /// Takes the bundle's serialized JSON (as exported by
@@ -549,7 +623,7 @@ mod commands {
     /// inviting database's identity (db_id + KDF salt).
     #[tauri::command]
     pub fn vdb_import_pairing(
-        state: State<'_, AppState>,
+        state: State<'_, Arc<AppState>>,
         bundle_json: String,
     ) -> ApiResponse<serde_json::Value> {
         let bundle = match PairingBundle::from_json(&bundle_json) {
@@ -562,47 +636,66 @@ mod commands {
             None => return ApiResponse::err(not_initialized()),
         };
         match core_ref.import_pairing(&bundle) {
-            Ok(entry) => ApiResponse::ok(serde_json::json!({
-                "device_id": hex(&entry.device_id),
-                "public_key": hex(&entry.public_key),
-                "trusted": entry.trusted,
-                "approved_by": entry.approved_by.map(|a| hex(&a)),
-                "created_at": entry.created_at,
-            })),
-            Err(e) => ApiResponse::err(ApiError::from(e)),
-        }
-    }
-
-    /// Discover peers on the LAN via UDP multicast.
-    #[tauri::command]
-    pub fn vdb_discover(
-        state: State<'_, AppState>,
-        timeout_ms: u64,
-    ) -> ApiResponse<serde_json::Value> {
-        let guard = state.core.lock().unwrap();
-        let core_ref = match guard.as_ref() {
-            Some(c) => c,
-            None => return ApiResponse::err(not_initialized()),
-        };
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        match rt.block_on(core_ref.discover_peers(timeout_ms)) {
-            Ok(peers) => {
-                let list: Vec<serde_json::Value> = peers.iter().map(|p| {
-                    serde_json::json!({
-                        "device_id": hex(&p.device_id),
-                        "public_key": hex(&p.public_key),
-                        "sync_addr": p.sync_addr.to_string(),
-                    })
-                }).collect();
-                ApiResponse::ok(serde_json::json!({ "peers": list }))
+            Ok(entry) => {
+                // The device may have adopted a new database identity
+                // — refresh the discovery beacon so announcements
+                // carry the adopted db_id.
+                drop(guard);
+                start_beacon(&state);
+                ApiResponse::ok(serde_json::json!({
+                    "device_id": hex(&entry.device_id),
+                    "public_key": hex(&entry.public_key),
+                    "trusted": entry.trusted,
+                    "approved_by": entry.approved_by.map(|a| hex(&a)),
+                    "created_at": entry.created_at,
+                }))
             }
             Err(e) => ApiResponse::err(ApiError::from(e)),
         }
     }
-
+    /// Discover VeilDB peers on the LAN via UDP multicast. Returns
+    /// every verified peer (with its db_id) so the GUI can show which
+    /// ones already belong to this database and which would be joined
+    /// via auto-pairing.
+    #[tauri::command]
+    pub fn vdb_discover(
+        state: State<'_, Arc<AppState>>,
+        timeout_ms: u64,
+    ) -> ApiResponse<serde_json::Value> {
+        let guard = state.core.lock().unwrap();
+        let my_db: Option<[u8; 32]> = guard.as_ref().map(|c| {
+            c.status().map(|s| s.db_id).unwrap_or([0u8; 32])
+        });
+        let rt = runtime();
+        let peers = match rt.block_on(veildb_sync::discovery::discover_all(
+            std::time::Duration::from_millis(timeout_ms),
+        )) {
+            Ok(p) => p,
+            Err(e) => {
+                return ApiResponse::err(ApiError {
+                    message: e.to_string(),
+                    code: None,
+                    is_integrity: false,
+                })
+            }
+        };
+        let list: Vec<serde_json::Value> = peers
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "device_id": hex(&p.device_id),
+                    "public_key": hex(&p.public_key),
+                    "db_id": hex(&p.db_id),
+                    "sync_addr": p.sync_addr.to_string(),
+                    "same_db": my_db.map(|m| m == p.db_id).unwrap_or(false),
+                })
+            })
+            .collect();
+        ApiResponse::ok(serde_json::json!({ "peers": list }))
+    }
     /// Query the persistent merge log (deterministic conflict resolutions).
     #[tauri::command]
-    pub fn vdb_merges(state: State<'_, AppState>) -> ApiResponse<serde_json::Value> {
+    pub fn vdb_merges(state: State<'_, Arc<AppState>>) -> ApiResponse<serde_json::Value> {
         let guard = state.core.lock().unwrap();
         let core_ref = match guard.as_ref() {
             Some(c) => c,
@@ -625,9 +718,8 @@ mod commands {
             Err(e) => ApiResponse::err(ApiError::from(e)),
         }
     }
-
     #[tauri::command]
-    pub fn vdb_rotate_key(state: State<'_, AppState>) -> ApiResponse<serde_json::Value> {
+    pub fn vdb_rotate_key(state: State<'_, Arc<AppState>>) -> ApiResponse<serde_json::Value> {
         let mut guard = state.core.lock().unwrap();
         let core_ref = match guard.as_mut() {
             Some(c) => c,
@@ -640,9 +732,8 @@ mod commands {
             Err(e) => ApiResponse::err(ApiError::from(e)),
         }
     }
-
     #[tauri::command]
-    pub fn vdb_get_dag(state: State<'_, AppState>) -> ApiResponse<serde_json::Value> {
+    pub fn vdb_get_dag(state: State<'_, Arc<AppState>>) -> ApiResponse<serde_json::Value> {
         let guard = state.core.lock().unwrap();
         let core = match guard.as_ref() {
             Some(c) => c,
@@ -675,9 +766,8 @@ mod commands {
             Err(e) => ApiResponse::err(ApiError::from(e)),
         }
     }
-
     #[tauri::command]
-    pub fn vdb_get_merkle_tree(state: State<'_, AppState>) -> ApiResponse<serde_json::Value> {
+    pub fn vdb_get_merkle_tree(state: State<'_, Arc<AppState>>) -> ApiResponse<serde_json::Value> {
         let guard = state.core.lock().unwrap();
         let core = match guard.as_ref() {
             Some(c) => c,
@@ -712,7 +802,6 @@ mod commands {
             Err(e) => ApiResponse::err(ApiError::from(e)),
         }
     }
-
     /// Dev-only: corrupt an operation's ciphertext.
     ///
     /// This is ONLY available in debug builds. It flips bytes in the
@@ -722,7 +811,7 @@ mod commands {
     #[cfg(debug_assertions)]
     #[tauri::command]
     pub fn vdb_dev_corrupt_operation(
-        state: State<'_, AppState>,
+        state: State<'_, Arc<AppState>>,
         device_id: String,
         sequence: u64,
     ) -> ApiResponse<()> {
@@ -745,9 +834,7 @@ mod commands {
         }
     }
 }
-
 use commands::*;
-
 fn not_initialized() -> ApiError {
     ApiError {
         message: "Database not initialized or opened".to_string(),
@@ -755,7 +842,6 @@ fn not_initialized() -> ApiError {
         is_integrity: false,
     }
 }
-
 fn parse_hex(s: &str) -> Result<[u8; 32], String> {
     let s = s.trim();
     if s.len() != 64 {
@@ -768,11 +854,9 @@ fn parse_hex(s: &str) -> Result<[u8; 32], String> {
     }
     Ok(bytes)
 }
-
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
-
 fn parse_clock(s: &str) -> Result<LogicalClock, String> {
     let mut clock = LogicalClock::new();
     for part in s.split(',') {
@@ -786,33 +870,114 @@ fn parse_clock(s: &str) -> Result<LogicalClock, String> {
     clock.entries.sort();
     Ok(clock)
 }
-
+/// Best-effort detection of this machine's LAN IP (for display in
+/// the GUI). Uses the connected-UDP-socket trick: no packet is sent.
+fn detect_local_ip() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    Some(socket.local_addr().ok()?.ip().to_string())
+}
+/// Serve ONE inbound sync session on the background listener:
+/// locks the core (if a DB is open), runs probe → auto-pair → sync.
+/// When no database is open the peer gets a clear error frame.
+///
+/// Runs inside `spawn_blocking`: the core mutex is held for the whole
+/// session (same as a foreground `vdb_sync_now`), which serializes
+/// concurrent sessions but keeps command handlers safe.
+fn handle_incoming_session(state: Arc<AppState>, stream: tokio::net::TcpStream, peer: String) {
+    let mut guard = state.core.lock().unwrap();
+    match guard.as_mut() {
+        None => {
+            let send_err = async {
+                let mut backend = veildb_sync::LanBackend::from_stream(stream);
+                backend
+                    .send(veildb_sync::SyncMessage::Error {
+                        message: "No database is open on this peer — open a database and try again."
+                            .to_string(),
+                    })
+                    .await
+            };
+            let _ = runtime().block_on(send_err);
+            append_log(&format!("sync session from {peer} rejected: no database open"));
+        }
+        Some(core) => match runtime().block_on(core.serve_sync_stream(stream)) {
+            Ok(r) => {
+                append_log(&format!(
+                    "inbound sync from {peer}: paired={} adopted={} sent={} recv={} merged={}",
+                    r.paired,
+                    r.adopted,
+                    r.report.as_ref().map(|x| x.operations_sent).unwrap_or(0),
+                    r.report.as_ref().map(|x| x.operations_received).unwrap_or(0),
+                    r.report.as_ref().map(|x| x.operations_merged).unwrap_or(0),
+                ));
+            }
+            Err(e) => append_log(&format!("inbound sync from {peer} failed: {e}")),
+        },
+    }
+}
 /// Setup the Tauri plugin.
 pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
-
     let log_file = std::env::current_exe()
         .unwrap_or_default()
         .parent()
         .unwrap_or(std::path::Path::new("."))
         .join("veildb-debug.log");
-
     let mut f = std::fs::File::create(&log_file)?;
     writeln!(f, "=== VeilDB Setup ===")?;
     writeln!(f, "Working dir: {:?}", std::env::current_dir())?;
     writeln!(f, "Exe path: {:?}", std::env::current_exe())?;
-
     // Window is created from tauri.conf.json — no programmatic creation needed.
     writeln!(f, "Window configured via tauri.conf.json")?;
-
-    // Manage app state.
-    app.manage(AppState::new());
-
+    // Manage app state (Arc so the background listener can clone it).
+    let state = Arc::new(AppState::new());
+    app.manage(state.clone());
+    // Background sync listener: binds SYNC_PORT for the whole app
+    // lifetime so this machine can RECEIVE one-click sync sessions
+    // without the user running any command. A second instance on the
+    // same machine would fail to bind — that's fine (log and skip).
+    {
+        let state_for_listener = state.clone();
+        std::thread::Builder::new()
+            .name("veildb-sync-listener".into())
+            .spawn(move || {
+                runtime().block_on(async move {
+                    match tokio::net::TcpListener::bind(("0.0.0.0", SYNC_PORT)).await {
+                        Ok(listener) => {
+                            append_log(&format!(
+                                "background sync listener started on 0.0.0.0:{SYNC_PORT}"
+                            ));
+                            loop {
+                                match listener.accept().await {
+                                    Ok((stream, peer)) => {
+                                        append_log(&format!(
+                                            "inbound sync connection from {peer}"
+                                        ));
+                                        let st = state_for_listener.clone();
+                                        let peer_s = peer.to_string();
+                                        tokio::task::spawn_blocking(move || {
+                                            handle_incoming_session(st, stream, peer_s)
+                                        });
+                                    }
+                                    Err(e) => {
+                                        append_log(&format!("listener accept error: {e}"));
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            append_log(&format!(
+                                "background sync listener could not bind port {SYNC_PORT}: {e} \
+                                 (another VeilDB instance may be running)"
+                            ));
+                        }
+                    }
+                });
+            })?;
+    }
     writeln!(f, "Setup complete.")?;
-
     Ok(())
 }
-
 /// Register all Tauri commands.
 pub fn run() {
     let result = tauri::Builder::default()
@@ -835,6 +1000,8 @@ pub fn run() {
             vdb_restore,
             vdb_snapshot,
             vdb_sync_lan,
+            vdb_sync_now,
+            vdb_sync_info,
             vdb_sync_listen,
             vdb_export_pairing,
             vdb_import_pairing,
@@ -847,7 +1014,6 @@ pub fn run() {
             vdb_dev_corrupt_operation,
         ])
         .run(tauri::generate_context!());
-
     if let Err(e) = result {
         let log_file = std::env::current_exe()
             .unwrap_or_default()
@@ -857,4 +1023,4 @@ pub fn run() {
         let _ = std::fs::write(&log_file, format!("Tauri run error: {e}\n"));
         eprintln!("error while running tauri application: {e}");
     }
-}
+}

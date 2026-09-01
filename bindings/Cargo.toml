@@ -19,6 +19,7 @@ tauri-build.workspace = true
 
 [dependencies]
 veildb-core = { path = "../crates/core" }
+veildb-sync = { path = "../crates/sync" }
 tauri.workspace = true
 tauri-plugin-dialog = "2"
 serde.workspace = true

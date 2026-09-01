@@ -54,6 +54,30 @@ export interface DiscoveredPeer {
   device_id: string;
   public_key: string;
   sync_addr: string;
+  db_id?: string;
+  same_db?: boolean;
+}
+
+export interface SyncInfo {
+  sync_port: number;
+  listening: boolean;
+  beacon_running: boolean;
+  db_open: boolean;
+  local_ip: string;
+}
+
+export interface SyncNowResult {
+  peer_addr: string;
+  peer_device_id?: string | null;
+  paired: boolean;
+  adopted: boolean;
+  discovered: DiscoveredPeer[];
+  success: boolean;
+  message: string;
+  operations_received?: number | null;
+  operations_sent?: number | null;
+  operations_merged?: number | null;
+  merkle_root?: string | null;
 }
 
 export interface MergeEntry {

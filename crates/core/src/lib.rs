@@ -31,8 +31,9 @@ use veildb_storage::{
     MergeLogEntry, Operation, OperationId, SqliteStorage, StorageEngine,
 };
 use veildb_sync::{
-    LanBackend, SyncBackend, SyncEngine, SyncReport, TrustProvider,
-    discovery::DiscoveredPeer,
+    LanBackend, SyncBackend, SyncEngine, SyncMessage, SyncReport, TrustProvider,
+    SYNC_PROTOCOL_VERSION,
+    discovery::{DiscoveredPeer, DiscoveredPeerInfo},
 };
 
 use error::CoreError;
@@ -108,6 +109,65 @@ impl PairingBundle {
     /// Parse from JSON.
     pub fn from_json(json: &str) -> Result<Self, CoreError> {
         serde_json::from_str(json).map_err(|e| CoreError::Serialization(e.to_string()))
+    }
+}
+
+/// Result of a one-click auto sync ([`VeilDbCore::sync_auto`] or the
+/// inbound listener path).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoSyncReport {
+    /// Address the session ran against.
+    pub peer_addr: String,
+    /// The peer's device ID, once the probe has been authenticated.
+    pub peer_device_id: Option<[u8; 32]>,
+    /// Whether a pairing happened during this session.
+    pub paired: bool,
+    /// Whether WE adopted the peer's database identity (we were the
+    /// joining device).
+    pub adopted: bool,
+    /// The underlying engine sync report (None if the session was
+    /// rejected before reaching the sync phase).
+    pub report: Option<SyncReport>,
+    /// Peers found via discovery when no explicit address was given.
+    pub discovered: Vec<DiscoveredPeerInfo>,
+    /// Overall success.
+    pub success: bool,
+    /// Human-readable message for the UI.
+    pub message: String,
+}
+
+/// Wire format for the signed pairing bundle as exchanged during
+/// auto-pairing (mirrors [`PairingBundle`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PairingBundleWire {
+    db_id: [u8; 32],
+    salt: [u8; 32],
+    device_id: [u8; 32],
+    approver_public_key: [u8; 32],
+    signature: Vec<u8>,
+}
+
+impl From<&PairingBundle> for PairingBundleWire {
+    fn from(b: &PairingBundle) -> Self {
+        Self {
+            db_id: b.db_id,
+            salt: b.salt,
+            device_id: b.device_id,
+            approver_public_key: b.approver_public_key,
+            signature: b.signature.clone(),
+        }
+    }
+}
+
+impl From<PairingBundleWire> for PairingBundle {
+    fn from(w: PairingBundleWire) -> Self {
+        Self {
+            db_id: w.db_id,
+            salt: w.salt,
+            device_id: w.device_id,
+            approver_public_key: w.approver_public_key,
+            signature: w.signature,
+        }
     }
 }
 
@@ -226,6 +286,10 @@ pub struct VeilDbCore {
     signing: Arc<SigningKeyPair>,
     /// The X25519 keypair.
     x25519: Arc<X25519KeyPair>,
+    /// The passphrase, retained in memory so automatic pairing can
+    /// re-derive the master key under an adopted KDF salt without a
+    /// manual reopen (one-click sync). Zeroized on drop.
+    secret: SecretString,
 }
 
 impl VeilDbCore {
@@ -403,6 +467,7 @@ impl VeilDbCore {
             path: path.to_path_buf(),
             signing,
             x25519,
+            secret: passphrase,
         })
     }
 
@@ -539,13 +604,27 @@ impl VeilDbCore {
                 });
             }
             SyncBackendKind::Lan { addr } => {
-                let mut backend = veildb_sync::LanBackend::connect(&addr).await?;
-                let report = self.sync.sync(&mut backend).await?;
-                backend.close().await?;
+                // Auto path: pairing probe first (no-op when already
+                // paired), then the engine sync — so CLI↔CLI, CLI↔GUI
+                // and GUI↔GUI all speak the same one-click protocol.
+                let report = self
+                    .sync_auto(Some(addr))
+                    .await?
+                    .report
+                    .ok_or_else(|| {
+                        CoreError::Serialization("sync session was rejected".to_string())
+                    })?;
                 report
             }
             SyncBackendKind::Listen { addr } => {
-                self.sync_listen_once(&addr).await?
+                let report = self
+                    .sync_listen_auto(&addr, || {})
+                    .await?
+                    .report
+                    .ok_or_else(|| {
+                        CoreError::Serialization("sync session was rejected".to_string())
+                    })?;
+                report
             }
             #[cfg(feature = "sync-cloud")]
             SyncBackendKind::Cloud => {
@@ -652,22 +731,32 @@ impl VeilDbCore {
         )
         .map_err(|_| CoreError::Serialization("invalid pairing bundle signature".to_string()))?;
 
-        // If this device's database is still empty AND it belongs to a
-        // different database (i.e. this is the joining device), adopt
-        // the inviting database's identity (db_id and KDF salt) so the
-        // data key derives identically from the shared passphrase on
-        // the next open. The originating device keeps its identity.
-        if self.db_id != bundle.db_id && self.storage.operation_count()? == 0 {
-            self.storage.set_metadata(META_DB_ID, &bundle.db_id)?;
-            self.storage.set_metadata(META_SALT, &bundle.salt)?;
-            // Discard the per-device key material encrypted under the
-            // old (pre-adoption) data key; fresh keys are generated
-            // and stored under the new key on the next open.
-            self.storage.delete_metadata(META_SIGNING_KEY)?;
-            self.storage.delete_metadata(META_X25519_KEY)?;
+        // If this device's database belongs to a different database,
+        // it can only adopt the inviting identity while still empty:
+        // every existing local operation was encrypted under the OLD
+        // data key and would be unreadable after the switch.
+        if self.db_id != bundle.db_id {
+            if self.storage.operation_count()? > 0 {
+                return Err(CoreError::Serialization(
+                    "cannot join: this database already contains data and belongs to a \
+                     different database. Open a fresh empty database on this device and retry."
+                        .to_string(),
+                ));
+            }
+            self.adopt_identity(bundle)?;
         }
 
-        self.access.approve_device(&bundle.approver_public_key)?;
+        // Approve the inviting device (idempotent: already-trusted is
+        // not an error here — repeated pairing/sync must succeed).
+        let target_id = veildb_crypto::hash(&bundle.approver_public_key);
+        let already_trusted = self
+            .access
+            .list_devices()?
+            .into_iter()
+            .any(|d| d.device_id == target_id && d.trusted);
+        if !already_trusted {
+            self.access.approve_device(&bundle.approver_public_key)?;
+        }
 
         // Return the resulting trust entry for the approved device.
         let entry = self
@@ -679,6 +768,93 @@ impl VeilDbCore {
                 CoreError::Serialization("approved device not found in registry".to_string())
             })?;
         Ok(entry)
+    }
+
+    /// Adopt a foreign database identity in place (must be empty).
+    ///
+    /// Re-derives the master key from the retained passphrase and the
+    /// adopted salt, regenerates the device keys under it, rewrites
+    /// the identity metadata, and rebuilds every engine — all without
+    /// requiring the database to be reopened.
+    fn adopt_identity(&mut self, bundle: &PairingBundle) -> Result<(), CoreError> {
+        debug_assert_eq!(self.storage.operation_count()?, 0);
+
+        // Re-derive the master key under the adopted salt.
+        let new_master = derive_key(self.secret.as_bytes(), &bundle.salt)?;
+
+        // Reset identity metadata; fresh keys are generated below.
+        self.storage.set_metadata(META_DB_ID, &bundle.db_id)?;
+        self.storage.set_metadata(META_SALT, &bundle.salt)?;
+        self.storage.delete_metadata(META_SIGNING_KEY)?;
+        self.storage.delete_metadata(META_X25519_KEY)?;
+
+        // Generate fresh device keypairs and persist them under the
+        // new master key (mirrors the init path).
+        let new_signing = Arc::new(SigningKeyPair::generate());
+        let new_x25519 = Arc::new(X25519KeyPair::generate());
+
+        let sk_ct = encrypt(
+            &new_master,
+            self.key_version,
+            new_signing.secret_bytes().as_ref(),
+        )
+        .map_err(|e| CoreError::Crypto(e))?;
+        let xk_ct = encrypt(&new_master, self.key_version, &new_x25519.secret_bytes())
+            .map_err(|e| CoreError::Crypto(e))?;
+        let sk_bytes =
+            postcard::to_allocvec(&sk_ct).map_err(|e| CoreError::Serialization(e.to_string()))?;
+        let xk_bytes =
+            postcard::to_allocvec(&xk_ct).map_err(|e| CoreError::Serialization(e.to_string()))?;
+        self.storage.set_metadata(META_SIGNING_KEY, &sk_bytes)?;
+        self.storage.set_metadata(META_X25519_KEY, &xk_bytes)?;
+
+        // Adopt the new identity in memory and rebuild every engine
+        // that captures the master key, signing key or db id.
+        let old_self_device = veildb_crypto::hash(&{
+            let old = self.signing.public_key();
+            old
+        });
+        self.db_id = bundle.db_id;
+        self.signing = new_signing.clone();
+        self.x25519 = new_x25519.clone();
+        self.rebuild_engines(new_master);
+
+        // Register ourselves under the new identity as the root
+        // device (the old registry entry references the discarded
+        // pre-adoption key).
+        self.access.bootstrap_root()?;
+        // Retire the stale pre-adoption self entry so the registry
+        // only shows live devices.
+        let _ = self.access.revoke_device(&old_self_device);
+        Ok(())
+    }
+
+    /// Rebuild the access/query/sync engines after an in-place
+    /// identity adoption (master key / signing key / db id changed).
+    fn rebuild_engines(&mut self, master_key: veildb_crypto::Key) {
+        self.access = AccessEngine::new(
+            SqliteStorage::open(&self.path).expect("reopen storage for access engine"),
+            self.signing.clone(),
+            self.x25519.clone(),
+            master_key.clone(),
+            self.key_version,
+            self.db_id,
+        );
+        self.query = QueryEngine::new(
+            SqliteStorage::open(&self.path).expect("reopen storage for query engine"),
+            master_key.clone(),
+            self.key_version,
+        );
+        self.sync = SyncEngine::new(
+            SqliteStorage::open(&self.path).expect("reopen storage for sync engine"),
+            self.signing.clone(),
+            self.db_id,
+            Arc::new(LiveTrustProvider {
+                storage: std::sync::Mutex::new(
+                    SqliteStorage::open(&self.path).expect("reopen storage for trust provider"),
+                ),
+            }),
+        );
     }
 
     /// Run one sync session with a peer over TCP (client side).
@@ -732,6 +908,587 @@ impl VeilDbCore {
         .await?;
 
         self.sync_listen_once(addr).await
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // One-click auto sync: discovery → probe → auto-pair → sync.
+    // ─────────────────────────────────────────────────────────────
+
+    /// Timeout applied to every message exchange during the pairing
+    /// phase (the engine phase keeps the engine's own semantics).
+    const PAIR_MSG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// Message returned when two populated databases from different
+    /// databases meet. Both sides show it verbatim in the UI.
+    const MSG_BOTH_NON_EMPTY: &str = "Both databases contain data and belong to DIFFERENT \
+         databases, so they cannot be merged automatically (each was encrypted with a \
+         different key). Open a FRESH EMPTY database on one of the devices and run Sync \
+         again — the empty one will automatically join the other.";
+
+    /// One-click sync.
+    ///
+    /// Pass `None` (or an empty string) to discover peers on the LAN
+    /// via UDP multicast and dial the first one found; or pass an
+    /// explicit `ip:port` (the manual-IP path). The session runs a
+    /// pairing probe first: peers that already share the database
+    /// identity go straight into the sync protocol; unpaired peers
+    /// auto-pair securely (proof of shared passphrase + deterministic
+    /// identity adoption for the empty side) and then sync.
+    pub async fn sync_auto(&mut self, addr: Option<String>) -> Result<AutoSyncReport, CoreError> {
+        // Resolve the target address: explicit, or via discovery.
+        let (target, discovered) = match addr.as_deref().map(str::trim) {
+            Some(a) if !a.is_empty() => (a.to_string(), Vec::new()),
+            _ => {
+                let peers = self.discover_peers_all(2500).await?;
+                let me = veildb_crypto::hash(&self.signing.public_key());
+                let pick = peers
+                    .iter()
+                    .find(|p| p.device_id != me)
+                    .map(|p| p.sync_addr.to_string());
+                match pick {
+                    Some(t) => (t, peers),
+                    None => {
+                        return Ok(AutoSyncReport {
+                            peer_addr: String::new(),
+                            peer_device_id: None,
+                            paired: false,
+                            adopted: false,
+                            report: None,
+                            discovered: peers,
+                            success: false,
+                            message: "No peers found on this network. Make sure VeilDB is \
+                                      running with a database open on the other device, or \
+                                      enter its IP address and press Sync again."
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+        };
+
+        // Dial with a bounded connect timeout so the UI never hangs.
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::net::TcpStream::connect(&target),
+        )
+        .await
+        .map_err(|_| CoreError::Serialization(format!("connect to {target} timed out")))?
+        .map_err(|e| {
+            CoreError::Serialization(format!(
+                "cannot connect to {target}: {e}. Make sure VeilDB is running on the peer."
+            ))
+        })?;
+
+        self.run_outbound_session(stream, &target, discovered).await
+    }
+
+    /// Listen on `addr`, accept ONE inbound session, and serve it
+    /// (probe → auto-pair → sync). Used by the CLI `sync --listen`.
+    pub async fn sync_listen_auto<F>(&mut self, addr: &str, ready: F) -> Result<AutoSyncReport, CoreError>
+    where
+        F: FnOnce(),
+    {
+        let listener = LanBackend::listen(addr).await?;
+        ready();
+        let (stream, peer) = listener
+            .accept()
+            .await
+            .map_err(|e| CoreError::Serialization(format!("accept failed: {e}")))?;
+        let peer_addr = peer.to_string();
+        let mut report = self.serve_sync_stream(stream).await?;
+        report.peer_addr = peer_addr;
+        Ok(report)
+    }
+
+    /// Serve one inbound auto-sync session over an already-accepted
+    /// TCP stream. Used by the GUI's background sync listener so the
+    /// app can RECEIVE sync sessions without any manual listening.
+    pub async fn serve_sync_stream(
+        &mut self,
+        stream: tokio::net::TcpStream,
+    ) -> Result<AutoSyncReport, CoreError> {
+        let peer_addr = stream
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        let mut backend = LanBackend::from_stream(stream);
+
+        let my_ops = self.storage.operation_count()?;
+        let my_db_orig = self.db_id;
+        let my_pub = self.signing.public_key();
+        let nonce_r = veildb_crypto::random_bytes_32();
+
+        // 1. Receive the initiator's probe.
+        let probe = match tokio::time::timeout(Self::PAIR_MSG_TIMEOUT, backend.receive()).await {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => {
+                return Err(CoreError::Serialization(
+                    "timed out waiting for pairing probe".to_string(),
+                ));
+            }
+        };
+        let (initiator_db, initiator_dev, _initiator_pub, initiator_ops, nonce_i) = match probe {
+            SyncMessage::PairProbe {
+                protocol_version,
+                db_id,
+                device_id,
+                public_key,
+                operation_count,
+                nonce,
+            } => {
+                if protocol_version != SYNC_PROTOCOL_VERSION {
+                    let _ = backend
+                        .send(SyncMessage::Error {
+                            message: "protocol version mismatch".to_string(),
+                        })
+                        .await;
+                    return Err(CoreError::Serialization(
+                        "protocol version mismatch".to_string(),
+                    ));
+                }
+                (db_id, device_id, public_key, operation_count, nonce)
+            }
+            SyncMessage::Error { message } => {
+                return Err(CoreError::Serialization(format!("peer error: {message}")));
+            }
+            _ => {
+                let _ = backend
+                    .send(SyncMessage::Error {
+                        message: "expected pairing probe".to_string(),
+                    })
+                    .await;
+                return Err(CoreError::Serialization("expected pairing probe".to_string()));
+            }
+        };
+
+        // 2. Reply with our signed probe ack. The signature over
+        //    `public_key || probe_nonce || db_id` authenticates us.
+        let mut ack_msg = Vec::with_capacity(96);
+        ack_msg.extend_from_slice(&my_pub);
+        ack_msg.extend_from_slice(&nonce_i);
+        ack_msg.extend_from_slice(&self.db_id);
+        let signature = self.signing.sign(&ack_msg);
+        backend
+            .send(SyncMessage::PairProbeAck {
+                protocol_version: SYNC_PROTOCOL_VERSION,
+                db_id: self.db_id,
+                device_id: veildb_crypto::hash(&my_pub),
+                public_key: my_pub,
+                operation_count: my_ops,
+                nonce: nonce_r,
+                probe_nonce: nonce_i,
+                signature,
+            })
+            .await?;
+
+        // 3. Pair (if needed), then run the engine sync.
+        self.pairing_and_sync(
+            &mut backend,
+            peer_addr,
+            /*we_are_initiator*/ false,
+            my_db_orig,
+            initiator_db,
+            my_ops,
+            initiator_ops,
+            nonce_i,
+            nonce_r,
+            initiator_dev,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Outbound session: we dialed the peer, so we sent the probe and
+    /// now validate the signed ack.
+    async fn run_outbound_session(
+        &mut self,
+        stream: tokio::net::TcpStream,
+        target: &str,
+        discovered: Vec<DiscoveredPeerInfo>,
+    ) -> Result<AutoSyncReport, CoreError> {
+        let mut backend = LanBackend::from_stream(stream);
+
+        let my_ops = self.storage.operation_count()?;
+        let my_db_orig = self.db_id;
+        let nonce_i = veildb_crypto::random_bytes_32();
+
+        backend
+            .send(SyncMessage::PairProbe {
+                protocol_version: SYNC_PROTOCOL_VERSION,
+                db_id: self.db_id,
+                device_id: veildb_crypto::hash(&self.signing.public_key()),
+                public_key: self.signing.public_key(),
+                operation_count: my_ops,
+                nonce: nonce_i,
+            })
+            .await?;
+
+        let ack = match tokio::time::timeout(Self::PAIR_MSG_TIMEOUT, backend.receive()).await {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => {
+                return Err(CoreError::Serialization(
+                    "timed out waiting for peer reply".to_string(),
+                ));
+            }
+        };
+
+        let (peer_db, peer_dev, _peer_pub, peer_ops, nonce_r) = match ack {
+            SyncMessage::PairProbeAck {
+                protocol_version,
+                db_id,
+                device_id,
+                public_key,
+                operation_count,
+                nonce,
+                probe_nonce,
+                signature,
+            } => {
+                if protocol_version != SYNC_PROTOCOL_VERSION {
+                    return Err(CoreError::Serialization(
+                        "peer speaks a different protocol version".to_string(),
+                    ));
+                }
+                if probe_nonce != nonce_i {
+                    return Err(CoreError::Serialization(
+                        "peer replayed a stale nonce".to_string(),
+                    ));
+                }
+                // Authenticate the responder: signature over
+                // `public_key || probe_nonce || db_id`.
+                let mut msg = Vec::with_capacity(96);
+                msg.extend_from_slice(&public_key);
+                msg.extend_from_slice(&probe_nonce);
+                msg.extend_from_slice(&db_id);
+                veildb_crypto::verify_signature(&public_key, &msg, &signature)
+                    .map_err(|_| CoreError::Serialization("peer authentication failed".to_string()))?;
+                (db_id, device_id, public_key, operation_count, nonce)
+            }
+            SyncMessage::Error { message } => {
+                return Err(CoreError::Serialization(format!("peer error: {message}")));
+            }
+            _ => {
+                return Err(CoreError::Serialization(
+                    "unexpected reply from peer (expected probe ack)".to_string(),
+                ));
+            }
+        };
+
+        self.pairing_and_sync(
+            &mut backend,
+            target.to_string(),
+            /*we_are_initiator*/ true,
+            my_db_orig,
+            peer_db,
+            my_ops,
+            peer_ops,
+            nonce_i,
+            nonce_r,
+            peer_dev,
+            discovered,
+        )
+        .await
+    }
+
+    /// Shared pairing phase + engine sync. Works identically for the
+    /// dialing and listening sides; roles are derived deterministically
+    /// from the probe exchange so both peers always agree.
+    #[allow(clippy::too_many_arguments)]
+    async fn pairing_and_sync(
+        &mut self,
+        backend: &mut dyn SyncBackend,
+        peer_addr: String,
+        we_are_initiator: bool,
+        my_db_orig: [u8; 32],
+        peer_db_orig: [u8; 32],
+        my_ops: u64,
+        peer_ops: u64,
+        nonce_i: [u8; 32],
+        nonce_r: [u8; 32],
+        peer_dev: [u8; 32],
+        discovered: Vec<DiscoveredPeerInfo>,
+    ) -> Result<AutoSyncReport, CoreError> {
+        let mut paired = false;
+        let mut adopted = false;
+
+        // Deterministic decision, identical on both sides:
+        // - equal db ids → already paired, straight to sync.
+        // - exactly one side empty → the empty side adopts.
+        // - both empty → the side with the GREATER db id adopts the
+        //   smaller one (byte-wise deterministic tiebreak).
+        // - both populated but different → impossible: reject.
+        enum Decision {
+            Straight,
+            WeAdopt,
+            WeKeep,
+            Incompatible,
+        }
+        let decision = if my_db_orig == peer_db_orig {
+            Decision::Straight
+        } else {
+            match (my_ops == 0, peer_ops == 0) {
+                (true, false) => Decision::WeAdopt,
+                (false, true) => Decision::WeKeep,
+                (true, true) => {
+                    if my_db_orig > peer_db_orig {
+                        Decision::WeAdopt
+                    } else {
+                        Decision::WeKeep
+                    }
+                }
+                (false, false) => Decision::Incompatible,
+            }
+        };
+
+        match decision {
+            Decision::Incompatible => {
+                // Both sides send the verdict, then read the peer's.
+                let _ = backend
+                    .send(SyncMessage::PairDecision {
+                        accepted: false,
+                        message: Self::MSG_BOTH_NON_EMPTY.to_string(),
+                    })
+                    .await;
+                let _ = tokio::time::timeout(Self::PAIR_MSG_TIMEOUT, backend.receive()).await;
+                return Ok(AutoSyncReport {
+                    peer_addr,
+                    peer_device_id: Some(peer_dev),
+                    paired: false,
+                    adopted: false,
+                    report: None,
+                    discovered,
+                    success: false,
+                    message: Self::MSG_BOTH_NON_EMPTY.to_string(),
+                });
+            }
+
+            Decision::WeAdopt => {
+                // We are the joining device: receive the keeper's
+                // signed bundle, adopt its identity in place (empty
+                // DB only — enforced by import_pairing), approve the
+                // keeper, then prove we share the passphrase.
+                let offer = match
+                    tokio::time::timeout(Self::PAIR_MSG_TIMEOUT, backend.receive()).await
+                {
+                    Ok(Ok(SyncMessage::PairBundleOffer {
+                        db_id,
+                        salt,
+                        device_id,
+                        approver_public_key,
+                        signature,
+                    })) => PairingBundle {
+                        db_id,
+                        salt,
+                        device_id,
+                        approver_public_key,
+                        signature,
+                    },
+                    Ok(Ok(SyncMessage::Error { message })) => {
+                        return Err(CoreError::Serialization(format!("peer error: {message}")));
+                    }
+                    Ok(Ok(_)) => {
+                        return Err(CoreError::Serialization(
+                            "expected pairing bundle from peer".to_string(),
+                        ));
+                    }
+                    Ok(Err(e)) => return Err(e.into()),
+                    Err(_) => {
+                        return Err(CoreError::Serialization(
+                            "timed out waiting for pairing bundle".to_string(),
+                        ));
+                    }
+                };
+
+                // Verifies the bundle signature, adopts db_id + salt,
+                // regenerates our device keys, rebuilds engines, and
+                // approves the keeper — all in memory.
+                self.import_pairing(&offer)?;
+                paired = true;
+                adopted = true;
+
+                // Prove knowledge of the shared passphrase. The proof
+                // binds BOTH ORIGINAL db ids and both nonces, so it
+                // cannot be replayed or transplanted.
+                let proof = veildb_crypto::pairing_proof(
+                    self.secret.as_bytes(),
+                    &nonce_i,
+                    &nonce_r,
+                    &my_db_orig,
+                    &peer_db_orig,
+                );
+                backend
+                    .send(SyncMessage::PairProof {
+                        public_key: self.signing.public_key(),
+                        proof,
+                        adopted: true,
+                    })
+                    .await?;
+
+                // The keeper verifies the proof, approves our new
+                // device key, and confirms.
+                match tokio::time::timeout(Self::PAIR_MSG_TIMEOUT, backend.receive()).await {
+                    Ok(Ok(SyncMessage::PairDecision { accepted: true, .. })) => {}
+                    Ok(Ok(SyncMessage::PairDecision { accepted: false, message })) => {
+                        return Err(CoreError::Serialization(format!(
+                            "peer rejected: {message}"
+                        )));
+                    }
+                    Ok(Ok(_)) => {
+                        return Err(CoreError::Serialization(
+                            "expected pairing decision from peer".to_string(),
+                        ));
+                    }
+                    Ok(Err(e)) => return Err(e.into()),
+                    Err(_) => {
+                        return Err(CoreError::Serialization(
+                            "timed out waiting for pairing decision".to_string(),
+                        ));
+                    }
+                }
+            }
+
+            Decision::WeKeep => {
+                // We are the keeper: hand the joiner our signed bundle
+                // (it carries db_id + salt only — no key material),
+                // verify its passphrase proof, approve its (possibly
+                // post-adoption) device key.
+                let bundle = self.export_pairing()?;
+                backend
+                    .send(SyncMessage::PairBundleOffer {
+                        db_id: bundle.db_id,
+                        salt: bundle.salt,
+                        device_id: bundle.device_id,
+                        approver_public_key: bundle.approver_public_key,
+                        signature: bundle.signature,
+                    })
+                    .await?;
+
+                let (joiner_pk, proof, _joined_flag) = match
+                    tokio::time::timeout(Self::PAIR_MSG_TIMEOUT, backend.receive()).await
+                {
+                    Ok(Ok(SyncMessage::PairProof {
+                        public_key,
+                        proof,
+                        adopted,
+                    })) => (public_key, proof, adopted),
+                    Ok(Ok(SyncMessage::Error { message })) => {
+                        return Err(CoreError::Serialization(format!("peer error: {message}")));
+                    }
+                    Ok(Ok(_)) => {
+                        return Err(CoreError::Serialization(
+                            "expected pairing proof from peer".to_string(),
+                        ));
+                    }
+                    Ok(Err(e)) => return Err(e.into()),
+                    Err(_) => {
+                        return Err(CoreError::Serialization(
+                            "timed out waiting for pairing proof".to_string(),
+                        ));
+                    }
+                };
+
+                // Role-consistent proof input: (nonce_i, nonce_r,
+                // initiator's ORIGINAL db, responder's ORIGINAL db).
+                let (exp_i, exp_r, exp_di, exp_dr) = if we_are_initiator {
+                    (nonce_i, nonce_r, my_db_orig, peer_db_orig)
+                } else {
+                    (nonce_i, nonce_r, peer_db_orig, my_db_orig)
+                };
+                let expected = veildb_crypto::pairing_proof(
+                    self.secret.as_bytes(),
+                    &exp_i,
+                    &exp_r,
+                    &exp_di,
+                    &exp_dr,
+                );
+                if proof != expected || joiner_pk == self.signing.public_key() {
+                    let _ = backend
+                        .send(SyncMessage::PairDecision {
+                            accepted: false,
+                            message: "pairing proof failed — passphrases differ?".to_string(),
+                        })
+                        .await;
+                    return Err(CoreError::Serialization(
+                        "peer failed the passphrase proof".to_string(),
+                    ));
+                }
+
+                // Approve the joiner's device key (idempotent).
+                let target_id = veildb_crypto::hash(&joiner_pk);
+                let already_trusted = self
+                    .access
+                    .list_devices()?
+                    .into_iter()
+                    .any(|d| d.device_id == target_id && d.trusted);
+                if !already_trusted {
+                    self.access.approve_device(&joiner_pk)?;
+                }
+                paired = true;
+
+                backend
+                    .send(SyncMessage::PairDecision {
+                        accepted: true,
+                        message: "paired".to_string(),
+                    })
+                    .await?;
+            }
+
+            Decision::Straight => {}
+        }
+
+        // Engine sync over the same connection.
+        let report = self.sync.sync(backend).await?;
+        backend.close().await?;
+        self.record_merge_log()?;
+
+        Ok(AutoSyncReport {
+            peer_addr,
+            peer_device_id: Some(peer_dev),
+            paired,
+            adopted,
+            report: Some(report),
+            discovered,
+            success: true,
+            message: if paired && adopted {
+                "Paired with peer (joined its database) and synced successfully".to_string()
+            } else if paired {
+                "Paired with peer and synced successfully".to_string()
+            } else {
+                "Sync completed successfully".to_string()
+            },
+        })
+    }
+
+    /// Discover ALL VeilDB peers on the LAN via UDP multicast
+    /// (regardless of which database they belong to), for the GUI's
+    /// peer list. Each result carries the peer's db_id so the UI can
+    /// mark which peers already belong to this database.
+    pub async fn discover_peers_all(
+        &self,
+        timeout_ms: u64,
+    ) -> Result<Vec<DiscoveredPeerInfo>, CoreError> {
+        Ok(veildb_sync::discovery::discover_all(std::time::Duration::from_millis(
+            timeout_ms,
+        ))
+        .await?)
+    }
+
+    /// Start the periodic signed discovery beacon for the CURRENT
+    /// identity. The GUI runs this while a database is open so other
+    /// devices can find this machine with one click.
+    pub async fn spawn_discovery_beacon(
+        &self,
+        sync_port: u16,
+        interval_ms: u64,
+    ) -> Result<(tokio::sync::mpsc::Sender<()>, tokio::task::JoinHandle<()>), CoreError> {
+        Ok(veildb_sync::discovery::spawn_beacon(
+            self.signing.clone(),
+            self.db_id,
+            sync_port,
+            std::time::Duration::from_millis(interval_ms),
+        )
+        .await?)
     }
 
     /// Discover peers on the LAN via UDP multicast for `timeout_ms`.
@@ -1114,6 +1871,179 @@ mod tests {
         let (dir, core) = test_core();
         assert!(core.get("missing").is_err());
         drop(dir);
+    }
+
+    // ─── One-click auto-pairing + sync ───
+
+    fn hex_str(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Bind an ephemeral listener and serve ONE inbound auto-sync
+    /// session from `core` (consumes it). Returns the bound address.
+    fn spawn_listener(core: VeilDbCore) -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let handle = tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut core = core;
+            let result = core.serve_sync_stream(stream).await;
+            assert!(result.is_ok(), "listener session failed: {:?}", result.err());
+        });
+        (handle, addr)
+    }
+
+    #[tokio::test]
+    async fn auto_pair_empty_joins_populated() {
+        let (dir_a, mut a) = test_core();
+        let a_path = dir_a.path().join("test.vdb");
+        a.put("greeting", b"hello from a").unwrap();
+
+        // Fresh empty database on the joining device.
+        let dir_b = tempdir().unwrap();
+        let mut b = VeilDbCore::init(
+            &dir_b.path().join("test.vdb"),
+            SecretString::new("test-passphrase".to_string()),
+        )
+        .unwrap();
+
+        let (server, addr) = spawn_listener(a);
+        let report = b.sync_auto(Some(addr.to_string())).await.unwrap();
+        server.await.unwrap();
+
+        assert!(report.success, "report: {:?}", report.message);
+        assert!(report.paired, "first sync must auto-pair");
+        assert!(report.adopted, "empty side must adopt the peer identity");
+        assert_eq!(report.report.as_ref().unwrap().operations_received, 1);
+
+        // B adopted A's database identity.
+        let a_db = {
+            let reopened = VeilDbCore::init(
+                &a_path,
+                SecretString::new("test-passphrase".to_string()),
+            )
+            .unwrap();
+            reopened.status().unwrap().db_id
+        };
+        assert_eq!(b.status().unwrap().db_id, a_db, "db ids must match");
+
+        // Data converged.
+        assert_eq!(b.get("greeting").unwrap(), b"hello from a");
+
+        // Mutual trust: A's registry contains B's NEW device key.
+        let reopened = VeilDbCore::init(
+            &a_path,
+            SecretString::new("test-passphrase".to_string()),
+        )
+        .unwrap();
+        let b_dev = hex_str(&b.status().unwrap().self_device_id);
+        let a_devices = reopened.list_devices().unwrap();
+        assert!(
+            a_devices
+                .iter()
+                .any(|d| d.trusted && hex_str(&d.device_id) == b_dev),
+            "keeper must trust the joiner's post-adoption device"
+        );
+        let b_devices = b.list_devices().unwrap();
+        assert_eq!(
+            b_devices.iter().filter(|d| d.trusted).count(),
+            2,
+            "joiner: self + keeper trusted (stale pre-adoption entry retired)"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_sync_second_round_transfers_only_new() {
+        let (dir_a, a) = test_core();
+        let a_path = dir_a.path().join("test.vdb");
+        let mut a = a;
+        a.put("k1", b"v1").unwrap();
+
+        let dir_b = tempdir().unwrap();
+        let mut b = VeilDbCore::init(
+            &dir_b.path().join("test.vdb"),
+            SecretString::new("test-passphrase".to_string()),
+        )
+        .unwrap();
+
+        let (server, addr) = spawn_listener(a);
+        let first = b.sync_auto(Some(addr.to_string())).await.unwrap();
+        server.await.unwrap();
+        assert!(first.paired);
+
+        // New write on A; second sync must pair=no and transfer 1 op.
+        let reopened = VeilDbCore::init(
+            &a_path,
+            SecretString::new("test-passphrase".to_string()),
+        )
+        .unwrap();
+        let mut a = reopened;
+        a.put("k2", b"v2").unwrap();
+
+        let (server, addr) = spawn_listener(a);
+        let second = b.sync_auto(Some(addr.to_string())).await.unwrap();
+        server.await.unwrap();
+
+        assert!(!second.paired, "already-paired peers must not re-run pairing");
+        assert_eq!(second.report.as_ref().unwrap().operations_received, 1);
+        assert_eq!(b.get("k2").unwrap(), b"v2");
+        assert_eq!(b.status().unwrap().operation_count, 2);
+    }
+
+    /// Like [`spawn_listener`] but tolerates a rejected session (the
+    /// incompatible-databases path returns Ok(AutoSyncReport) with
+    /// success=false on both sides).
+    fn spawn_listener_rejecting(
+        core: VeilDbCore,
+    ) -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let handle = tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut core = core;
+            match core.serve_sync_stream(stream).await {
+                Ok(r) => assert!(!r.success, "incompatible session must not succeed"),
+                Err(e) => panic!("listener errored unexpectedly: {e}"),
+            }
+        });
+        (handle, addr)
+    }
+
+    #[tokio::test]
+    async fn both_populated_different_databases_rejected() {
+        let (dir_a, a) = test_core();
+        let mut a = a;
+        a.put("mine", b"a-data").unwrap();
+
+        // C is populated too, but belongs to a different database.
+        let dir_c = tempdir().unwrap();
+        let mut c = VeilDbCore::init(
+            &dir_c.path().join("test.vdb"),
+            SecretString::new("test-passphrase".to_string()),
+        )
+        .unwrap();
+        c.put("theirs", b"c-data").unwrap();
+
+        let (server, addr) = spawn_listener_rejecting(a);
+        let report = c.sync_auto(Some(addr.to_string())).await.unwrap();
+        server.await.unwrap();
+
+        assert!(
+            !report.success,
+            "incompatible session must not succeed: {:?}",
+            report.message
+        );
+        assert!(
+            report.message.contains("DIFFERENT databases"),
+            "unexpected message: {}",
+            report.message
+        );
+        drop(dir_a);
+        drop(dir_c);
     }
 
     #[test]

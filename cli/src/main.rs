@@ -225,42 +225,66 @@ fn cmd_get(db: &PathBuf, key: &str) -> Result<()> {
 
 fn cmd_sync(db: &PathBuf, backend: &str, addr: Option<String>, listen: bool) -> Result<()> {
     let mut core = open_core(db)?;
-    let addr_opt = addr.clone();
-    let backend_kind = match backend {
-        "mock" => SyncBackendKind::Mock,
-        "lan" => {
-            let addr = addr_opt
-                .clone()
-                .ok_or_else(|| anyhow!("--addr is required for LAN backend"))?;
-            if listen {
-                SyncBackendKind::Listen { addr }
-            } else {
-                SyncBackendKind::Lan { addr }
-            }
-        }
-        other => return Err(anyhow!("Unknown backend: {other}")),
-    };
-
     let rt = tokio::runtime::Runtime::new()?;
-    let report = if listen {
+
+    let auto = if backend == "mock" {
+        // Mock backend: no network, report-only (test path).
+        None
+    } else if backend != "lan" {
+        return Err(anyhow!("Unknown backend: {backend}"));
+    } else if listen {
         let bind_addr = addr
             .clone()
             .ok_or_else(|| anyhow!("--addr is required for --listen"))?;
-        rt.block_on(core.sync_listen_once_with(&bind_addr, || {
+        Some(rt.block_on(core.sync_listen_auto(&bind_addr, || {
             println!("listening on {bind_addr}");
             use std::io::Write;
             std::io::stdout().flush().ok();
-        }))?
+        }))?)
     } else {
-        rt.block_on(core.sync(backend_kind))?
+        let dial_addr = addr
+            .clone()
+            .ok_or_else(|| anyhow!("--addr is required for LAN backend"))?;
+        Some(rt.block_on(core.sync_auto(Some(dial_addr)))?)
     };
-    println!("Sync report:");
-    println!("  Received: {} ops", report.operations_received);
-    println!("  Sent: {} ops", report.operations_sent);
-    println!("  Merged: {} ops", report.operations_merged);
-    println!("  Merkle root: {}", hex(&report.merkle_root));
-    println!("  Status: {}", if report.success { "OK" } else { "FAILED" });
-    println!("  Message: {}", report.message);
+
+    match auto {
+        None => {
+            rt.block_on(core.sync(SyncBackendKind::Mock))?;
+        }
+        Some(auto_report) => {
+            if let Some(peer_dev) = auto_report.peer_device_id {
+                println!("  Peer device: {}", hex(&peer_dev));
+            }
+            if auto_report.paired {
+                println!(
+                    "  Pairing: {}",
+                    if auto_report.adopted {
+                        "joined the peer's database (auto-paired)"
+                    } else {
+                        "approved the peer's device (auto-paired)"
+                    }
+                );
+            }
+            match auto_report.report {
+                Some(report) => {
+                    println!("Sync report:");
+                    println!("  Received: {} ops", report.operations_received);
+                    println!("  Sent: {} ops", report.operations_sent);
+                    println!("  Merged: {} ops", report.operations_merged);
+                    println!("  Merkle root: {}", hex(&report.merkle_root));
+                    println!(
+                        "  Status: {}",
+                        if report.success { "OK" } else { "FAILED" }
+                    );
+                    println!("  Message: {}", report.message);
+                }
+                None => {
+                    anyhow::bail!("{}", auto_report.message);
+                }
+            }
+        }
+    }
     Ok(())
 }
 
