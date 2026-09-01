@@ -894,8 +894,18 @@ fn handle_incoming_session(state: Arc<AppState>, stream: tokio::net::TcpStream, 
     let mut guard = match state.core.try_lock() {
         Ok(g) => g,
         Err(_) => {
+            // IMPORTANT: drain the dialer's probe before closing.
+            // If we close the socket with unread data still buffered,
+            // macOS sends a TCP RST and the dialer sees
+            // "Connection reset by peer (os error 54)" rather than our
+            // clean busy message.
             let send_busy = async {
                 let mut backend = veildb_sync::LanBackend::from_stream(stream);
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(1000),
+                    backend.receive(),
+                )
+                .await;
                 backend
                     .send(veildb_sync::SyncMessage::Error {
                         message: "This peer is already busy with another sync right now — try again in a moment."
@@ -912,8 +922,15 @@ fn handle_incoming_session(state: Arc<AppState>, stream: tokio::net::TcpStream, 
     };
     match guard.as_mut() {
         None => {
+            // Same drain-before-close trick: consume the probe so the
+            // close is a clean FIN, not an RST.
             let send_err = async {
                 let mut backend = veildb_sync::LanBackend::from_stream(stream);
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(1000),
+                    backend.receive(),
+                )
+                .await;
                 backend
                     .send(veildb_sync::SyncMessage::Error {
                         message: "No database is open on this peer — open a database and try again."
