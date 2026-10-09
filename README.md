@@ -25,9 +25,7 @@ VeilDB is an embedded key-value database where **your device is the only trusted
 
 Everything ships as one workspace: **7 Rust library crates + a CLI + a Tauri 2 desktop app + a blind rendezvous relay + a React frontend**.
 
-## Screenshots
-
-> Save your screenshots to `docs/screenshots/` using the file names below.
+## Screeshots
 
 **Dashboard** — live state of your encrypted, zero-trust database (operations, devices, key/format versions, integrity check, key rotation, snapshots, Merkle root, recent operations)
 
