@@ -161,7 +161,7 @@ export default function UserDemo({ onDataChanged }: UserDemoProps) {
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="text-xl font-semibold">User Accounts Demo</h2>
+        <h2 className="text-3xl font-bold tracking-tight gradient-text">User Accounts Demo</h2>
         <p className="text-sm text-slate-400 mt-1">
           Create and sign into accounts. Data is stored as{" "}
           <strong>encrypted key-value pairs</strong> in the real VeilDB database.
@@ -171,7 +171,7 @@ export default function UserDemo({ onDataChanged }: UserDemoProps) {
       </div>
 
       {message && (
-        <div className="p-3 bg-green-900/50 border border-green-700 text-green-200 rounded text-sm">
+        <div className="p-3 bg-mint-400/10 border border-mint-400/30 text-mint-400 text-sm">
           {message}
         </div>
       )}
@@ -181,54 +181,29 @@ export default function UserDemo({ onDataChanged }: UserDemoProps) {
         </div>
       )}
 
-      {/* How it works */}
-      <div className="bg-dark-800 border border-indigo-800/40 rounded p-4">
-        <h3 className="text-sm font-semibold text-indigo-300 mb-2">
-          ⚡ How VeilDB stores this data
-        </h3>
-        <div className="text-xs text-slate-400 space-y-1 font-mono">
-          <p>
-            <span className="text-blue-400">PUT</span>{" "}
-            <span className="text-yellow-300">"user:alice"</span> →{" "}
-            <span className="text-green-300">
-              {`{"username":"alice","email":"alice@example.com","role":"admin"}`}
-            </span>
-          </p>
-          <p>
-            <span className="text-blue-400">PUT</span>{" "}
-            <span className="text-yellow-300">"users:index"</span> →{" "}
-            <span className="text-green-300">{`["alice","bob"]`}</span>
-          </p>
-          <p className="text-slate-500 pt-1">
-            Each PUT creates a signed, hash-chained operation in the CRDT DAG →
-            updates the Merkle tree root.
-          </p>
-        </div>
-      </div>
-
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         {/* Create Account */}
-        <div className="bg-dark-800 border border-slate-700 rounded p-4">
-          <h3 className="text-lg font-medium mb-3">Create Account</h3>
+        <div className="glass p-5">
+          <h3 className="text-lg font-semibold mb-4 flex items-center gap-2.5 before:content-[''] before:h-4 before:w-1 before:bg-primary-500 before:rounded-full">Create Account</h3>
           <div className="space-y-2">
             <input
               type="text"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
               placeholder="Username"
-              className="w-full bg-dark-900 border border-slate-600 rounded px-3 py-2 text-sm"
+              className="w-full field px-3 py-2 text-sm"
             />
             <input
               type="email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               placeholder="Email"
-              className="w-full bg-dark-900 border border-slate-600 rounded px-3 py-2 text-sm"
+              className="w-full field px-3 py-2 text-sm"
             />
             <select
               value={role}
               onChange={(e) => setRole(e.target.value)}
-              className="w-full bg-dark-900 border border-slate-600 rounded px-3 py-2 text-sm"
+              className="w-full field px-3 py-2 text-sm"
             >
               <option value="user">User</option>
               <option value="admin">Admin</option>
@@ -239,11 +214,11 @@ export default function UserDemo({ onDataChanged }: UserDemoProps) {
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               placeholder="Password"
-              className="w-full bg-dark-900 border border-slate-600 rounded px-3 py-2 text-sm"
+              className="w-full field px-3 py-2 text-sm"
             />
             <button
               onClick={handleCreateAccount}
-              className="w-full bg-primary-600 hover:bg-primary-700 text-white rounded px-3 py-2 text-sm font-medium"
+              className="btn-cta px-5 py-2.5 text-sm font-medium"
             >
               Create Account → vdb_put
             </button>
@@ -251,26 +226,26 @@ export default function UserDemo({ onDataChanged }: UserDemoProps) {
         </div>
 
         {/* Sign In */}
-        <div className="bg-dark-800 border border-slate-700 rounded p-4">
-          <h3 className="text-lg font-medium mb-3">Sign In</h3>
+        <div className="glass p-5">
+          <h3 className="text-lg font-semibold mb-4 flex items-center gap-2.5 before:content-[''] before:h-4 before:w-1 before:bg-primary-500 before:rounded-full">Sign In</h3>
           <div className="space-y-2">
             <input
               type="text"
               value={loginUsername}
               onChange={(e) => setLoginUsername(e.target.value)}
               placeholder="Username"
-              className="w-full bg-dark-900 border border-slate-600 rounded px-3 py-2 text-sm"
+              className="w-full field px-3 py-2 text-sm"
             />
             <input
               type="password"
               value={loginPassword}
               onChange={(e) => setLoginPassword(e.target.value)}
               placeholder="Password"
-              className="w-full bg-dark-900 border border-slate-600 rounded px-3 py-2 text-sm"
+              className="w-full field px-3 py-2 text-sm"
             />
             <button
               onClick={handleSignIn}
-              className="w-full bg-dark-700 hover:bg-dark-600 rounded px-3 py-2 text-sm font-medium"
+              className="btn-cta px-5 py-2.5 text-sm font-medium"
             >
               Sign In → vdb_get
             </button>
@@ -279,12 +254,12 @@ export default function UserDemo({ onDataChanged }: UserDemoProps) {
       </div>
 
       {/* Stored Users */}
-      <div className="bg-dark-800 border border-slate-700 rounded p-4">
+      <div className="glass p-5">
         <div className="flex items-center justify-between mb-3">
-          <h3 className="text-lg font-medium">Stored Users</h3>
+          <h3 className="text-lg font-semibold flex items-center gap-2.5 before:content-[''] before:h-4 before:w-1 before:bg-primary-500 before:rounded-full">Stored Users</h3>
           <button
             onClick={() => setShowKeys(!showKeys)}
-            className="text-xs bg-dark-700 hover:bg-dark-600 px-2 py-1 rounded"
+            className="text-xs btn-ghost px-2 py-1"
           >
             {showKeys ? "Hide" : "Show"} Raw KV Pairs
           </button>
@@ -315,7 +290,7 @@ export default function UserDemo({ onDataChanged }: UserDemoProps) {
                 </span>
                 <button
                   onClick={() => handleDeleteUser(u.username)}
-                  className="text-xs bg-red-900 hover:bg-red-800 text-red-200 px-2 py-1 rounded"
+                  className="text-xs btn-danger px-2 py-1"
                 >
                   Delete
                 </button>
@@ -327,7 +302,7 @@ export default function UserDemo({ onDataChanged }: UserDemoProps) {
 
       {/* Raw KV pairs */}
       {showKeys && rawKeys.length > 0 && (
-        <div className="bg-dark-800 border border-slate-700 rounded p-4">
+        <div className="glass p-5">
           <h3 className="text-sm font-semibold text-yellow-300 mb-3">
             🔑 Raw Key-Value Pairs in VeilDB
           </h3>

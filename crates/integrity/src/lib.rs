@@ -229,7 +229,37 @@ pub struct IntegrityReport {
 ///
 /// Recomputes each operation's hash and checks that all parent
 /// references exist within the set. Returns a report.
+///
+/// NOTE: this checks structural integrity only. For tamper detection
+/// that actually catches modified *content* (a re-hash of tampered
+/// bytes still matches itself), use [`verify_operations_signed`].
 pub fn verify_operations(operations: &[Operation]) -> IntegrityReport {
+    verify_operations_inner(operations, None)
+}
+
+/// Verify integrity **including Ed25519 signatures**.
+///
+/// Like [`verify_operations`], but additionally re-checks every
+/// operation's signature against the signer's stored public key using
+/// the same recompute-hash-with-empty-signature scheme as sync step 9.
+/// A tampered operation (even a tip with no children) no longer
+/// re-hashes to a value its signature covers, so local
+/// `verify_integrity` detects it — as the README claims.
+///
+/// `public_keys` maps `device_id → Ed25519 public key`; operations
+/// from unknown devices count as failed (their signature cannot be
+/// checked, and zero-trust means "unverifiable ≠ verified").
+pub fn verify_operations_signed(
+    operations: &[Operation],
+    public_keys: &HashMap<[u8; 32], [u8; 32]>,
+) -> IntegrityReport {
+    verify_operations_inner(operations, Some(public_keys))
+}
+
+fn verify_operations_inner(
+    operations: &[Operation],
+    public_keys: Option<&HashMap<[u8; 32], [u8; 32]>>,
+) -> IntegrityReport {
     let mut failed = 0u64;
     let mut failed_hashes = Vec::new();
 
@@ -243,13 +273,45 @@ pub fn verify_operations(operations: &[Operation]) -> IntegrityReport {
 
     for op in operations {
         let h = operation_hash(op);
+        let mut bad = false;
+
         // Check parents exist.
         for parent in &op.parents {
             if !all_hashes.contains(parent) {
-                failed += 1;
-                failed_hashes.push(h);
+                bad = true;
                 break;
             }
+        }
+
+        // Check the Ed25519 signature (when keys are available).
+        if !bad {
+            if let Some(keys) = public_keys {
+                match keys.get(&op.device_id) {
+                    None => bad = true,
+                    Some(public_key) => {
+                        // The signature covers the hash computed with an
+                        // EMPTY signature field (see core's put path and
+                        // sync step 9).
+                        let mut unsigned = op.clone();
+                        unsigned.signature = Vec::new();
+                        let unsigned_hash = operation_hash(&unsigned);
+                        if veildb_crypto::verify_signature(
+                            public_key,
+                            &unsigned_hash,
+                            &op.signature,
+                        )
+                        .is_err()
+                        {
+                            bad = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if bad {
+            failed += 1;
+            failed_hashes.push(h);
         }
     }
 
@@ -276,6 +338,11 @@ pub fn verify_operations(operations: &[Operation]) -> IntegrityReport {
 /// - The graph has no cycles.
 /// - Every parent reference resolves to an existing operation.
 /// - Each device's sequence numbers are contiguous starting from 1.
+///
+/// Cycle detection is **iterative** (explicit stack, gray/black
+/// coloring): chain depth equals the number of writes, so a recursive
+/// DFS would overflow the stack on logs of a few thousand operations
+/// (sync step 10 and `verify` would crash).
 pub fn validate_graph(operations: &[Operation]) -> Result<(), IntegrityError> {
     // Build hash → operation map.
     let hash_to_op: HashMap<[u8; 32], &Operation> = operations
@@ -283,14 +350,53 @@ pub fn validate_graph(operations: &[Operation]) -> Result<(), IntegrityError> {
         .map(|op| (operation_hash(op), op))
         .collect();
 
-    // Check for cycles via DFS.
-    let mut visited: HashSet<[u8; 32]> = HashSet::new();
-    let mut in_stack: HashSet<[u8; 32]> = HashSet::new();
+    // Iterative DFS with explicit stack. Frames are (hash,
+    // next_parent_index) — exactly the state a recursive call would
+    // keep, but on the heap.
+    let mut visited: HashSet<[u8; 32]> = HashSet::new(); // black
+    let mut in_stack: HashSet<[u8; 32]> = HashSet::new(); // gray
 
     for op in operations {
-        let h = operation_hash(op);
-        if !visited.contains(&h) {
-            detect_cycle(&h, &hash_to_op, &mut visited, &mut in_stack)?;
+        let start = operation_hash(op);
+        if visited.contains(&start) {
+            continue;
+        }
+
+        in_stack.insert(start);
+        let mut stack: Vec<([u8; 32], usize)> = vec![(start, 0)];
+
+        while let Some((hash, next_parent)) = stack.pop() {
+            let parents: Vec<[u8; 32]> = match hash_to_op.get(&hash) {
+                Some(o) => o.parents.clone(),
+                None => {
+                    // Only reachable for the start node if it vanished;
+                    // parents are validated before being pushed.
+                    visited.insert(hash);
+                    in_stack.remove(&hash);
+                    continue;
+                }
+            };
+
+            if next_parent < parents.len() {
+                let parent = parents[next_parent];
+                // Resume this frame after the child returns.
+                stack.push((hash, next_parent + 1));
+
+                if !hash_to_op.contains_key(&parent) {
+                    return Err(IntegrityError::MissingParent(parent));
+                }
+                if in_stack.contains(&parent) {
+                    return Err(IntegrityError::GraphCycle);
+                }
+                if !visited.contains(&parent) {
+                    in_stack.insert(parent);
+                    stack.push((parent, 0));
+                }
+            } else {
+                // All parents expanded: mark black.
+                in_stack.remove(&hash);
+                visited.insert(hash);
+            }
         }
     }
 
@@ -313,36 +419,6 @@ pub fn validate_graph(operations: &[Operation]) -> Result<(), IntegrityError> {
         }
     }
 
-    Ok(())
-}
-
-fn detect_cycle(
-    hash: &[u8; 32],
-    hash_to_op: &HashMap<[u8; 32], &Operation>,
-    visited: &mut HashSet<[u8; 32]>,
-    in_stack: &mut HashSet<[u8; 32]>,
-) -> Result<(), IntegrityError> {
-    if in_stack.contains(hash) {
-        return Err(IntegrityError::GraphCycle);
-    }
-    if visited.contains(hash) {
-        return Ok(());
-    }
-
-    in_stack.insert(*hash);
-
-    if let Some(op) = hash_to_op.get(hash) {
-        for parent in &op.parents {
-            if hash_to_op.contains_key(parent) {
-                detect_cycle(parent, hash_to_op, visited, in_stack)?;
-            } else {
-                return Err(IntegrityError::MissingParent(*parent));
-            }
-        }
-    }
-
-    in_stack.remove(hash);
-    visited.insert(*hash);
     Ok(())
 }
 

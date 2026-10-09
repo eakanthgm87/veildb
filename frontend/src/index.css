@@ -1,14 +1,156 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  color-scheme: dark;
+}
+
+html,
 body {
   margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, sans-serif;
-  background-color: #0f172a;
-  color: #e2e8f0;
+  min-height: 100vh;
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  color: #e4e4e7;
+  /* Pure black with a top-left violet bloom + a faint technical grid,
+     mirroring the Render landing page. */
+  /* True AMOLED black with violet/purple blooms only — no blue/teal. */
+  background-color: #000000;
+  background-image:
+    radial-gradient(1000px 620px at 0% -10%, rgba(124, 58, 237, 0.22), transparent 62%),
+    radial-gradient(820px 620px at 100% 108%, rgba(139, 92, 246, 0.14), transparent 60%),
+    radial-gradient(600px 500px at 100% 0%, rgba(91, 33, 182, 0.10), transparent 60%),
+    linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px);
+  background-size: 100% 100%, 100% 100%, 100% 100%, 64px 64px, 64px 64px;
+  background-attachment: fixed;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 #root {
   min-height: 100vh;
+}
+
+@layer components {
+  /* Premium glass surface for cards, modals, chrome. */
+  .glass {
+    background: rgba(12, 12, 14, 0.6);
+    backdrop-filter: blur(18px) saturate(140%);
+    -webkit-backdrop-filter: blur(18px) saturate(140%);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+  }
+  .glass-strong {
+    background: rgba(6, 6, 8, 0.82);
+    backdrop-filter: blur(24px) saturate(140%);
+    -webkit-backdrop-filter: blur(24px) saturate(140%);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+  }
+
+  /* Violet → lavender → mint headline gradient (Render hero). */
+  .gradient-text {
+    background: linear-gradient(100deg, #8b5cf6 0%, #a78bfa 45%, #46e3b7 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: transparent;
+  }
+
+  /* Square primary CTA: white on black, like the landing "Get started". */
+  .btn-cta {
+    background: #ffffff;
+    color: #000000;
+    border-radius: 0;
+    font-weight: 600;
+    transition: background-color 0.15s ease, transform 0.05s ease;
+  }
+  .btn-cta:hover {
+    background: #d4d4d8;
+  }
+  .btn-cta:active {
+    transform: translateY(1px);
+  }
+
+  /* Square ghost button: 1px border on black. */
+  .btn-ghost {
+    background: transparent;
+    color: #e4e4e7;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 0;
+    transition: border-color 0.15s ease, background-color 0.15s ease;
+  }
+  .btn-ghost:hover {
+    border-color: rgba(255, 255, 255, 0.35);
+    background: rgba(255, 255, 255, 0.04);
+  }
+
+  /* Render-themed input: AMOLED black, square, violet focus ring. */
+  .field {
+    background: #000000;
+    color: #e4e4e7;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 0;
+    outline: none;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+  .field::placeholder {
+    color: #5f5f68;
+  }
+  .field:focus {
+    border-color: rgba(139, 92, 246, 0.6);
+    box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.15);
+  }
+
+  /* Square destructive button: red-tinted, matching the ghost weight. */
+  .btn-danger {
+    background: rgba(239, 68, 68, 0.12);
+    color: #fca5a5;
+    border: 1px solid rgba(239, 68, 68, 0.35);
+    border-radius: 0;
+    font-weight: 600;
+    transition: border-color 0.15s ease, background-color 0.15s ease;
+  }
+  .btn-danger:hover {
+    background: rgba(239, 68, 68, 0.2);
+    border-color: rgba(239, 68, 68, 0.55);
+  }
+}
+
+.font-mono,
+code,
+pre {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: #26262c;
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #36363e;
+  background-clip: content-box;
+}
+
+::selection {
+  background: rgba(139, 92, 246, 0.35);
+  color: #fff;
+}
+
+:focus-visible {
+  outline: 2px solid rgba(139, 92, 246, 0.6);
+  outline-offset: 1px;
 }

@@ -10,6 +10,7 @@ members = [
     "crates/core",
     "cli",
     "bindings",
+    "relay",
 ]
 
 [workspace.metadata]

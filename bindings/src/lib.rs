@@ -990,6 +990,28 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     writeln!(f, "Exe path: {:?}", std::env::current_exe())?;
     // Window is created from tauri.conf.json — no programmatic creation needed.
     writeln!(f, "Window configured via tauri.conf.json")?;
+    // Disable WebView2's built-in zoom + pinch-zoom so a trackpad pinch is
+    // delivered to the frontend as a ctrl+wheel event (handled by ZoomPanSvg)
+    // instead of scaling the whole page. Windows-only; best-effort.
+    #[cfg(windows)]
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.with_webview(|webview| {
+            use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings5;
+            use windows::core::Interface;
+            unsafe {
+                let controller = webview.controller();
+                if let Ok(core) = controller.CoreWebView2() {
+                    if let Ok(settings) = core.Settings() {
+                        let _ = settings.SetIsZoomControlEnabled(false);
+                        if let Ok(s5) = settings.cast::<ICoreWebView2Settings5>() {
+                            let _ = s5.SetIsPinchZoomEnabled(false);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Manage app state (Arc so the background listener can clone it).
     let state = Arc::new(AppState::new());
     app.manage(state.clone());

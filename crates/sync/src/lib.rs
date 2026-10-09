@@ -29,6 +29,57 @@ use error::SyncError;
 /// The current sync protocol version.
 pub const SYNC_PROTOCOL_VERSION: u32 = 1;
 
+/// Maximum accepted frame length (64 MiB), checked BEFORE allocating.
+///
+/// A peer controls the 4-byte length prefix of every frame; without a
+/// cap a malicious or corrupt peer could make us allocate ~4 GiB per
+/// message (memory-exhaustion DoS). Legitimate frames are bounded by
+/// the operation-log chunk size, well under this limit.
+pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+
+/// Write one length-prefixed postcard `SyncMessage` frame.
+///
+/// Shared by [`LanBackend`] and [`CloudBackend`] so the wire format is
+/// byte-identical regardless of transport (LAN TCP or relay pipe).
+async fn write_frame(
+    stream: &mut tokio::net::TcpStream,
+    message: &SyncMessage,
+) -> Result<(), SyncError> {
+    use tokio::io::AsyncWriteExt;
+    let bytes = postcard::to_allocvec(message)?;
+    if bytes.len() > MAX_FRAME_LEN {
+        return Err(SyncError::InvalidPeerMessage(format!(
+            "outgoing frame of {} bytes exceeds MAX_FRAME_LEN",
+            bytes.len()
+        )));
+    }
+    let len = (bytes.len() as u32).to_le_bytes();
+    stream.write_all(&len).await.map_err(SyncError::Io)?;
+    stream.write_all(&bytes).await.map_err(SyncError::Io)?;
+    stream.flush().await.map_err(SyncError::Io)?;
+    Ok(())
+}
+
+/// Read one length-prefixed postcard `SyncMessage` frame.
+///
+/// Rejects oversized length prefixes **before** allocating the buffer.
+async fn read_frame(stream: &mut tokio::net::TcpStream) -> Result<SyncMessage, SyncError> {
+    use tokio::io::AsyncReadExt;
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await.map_err(SyncError::Io)?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len > MAX_FRAME_LEN {
+        // Do NOT allocate: report the protocol violation instead.
+        return Err(SyncError::InvalidPeerMessage(format!(
+            "peer announced a {len} byte frame, exceeding MAX_FRAME_LEN ({MAX_FRAME_LEN})"
+        )));
+    }
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf).await.map_err(SyncError::Io)?;
+    postcard::from_bytes(&buf).map_err(|e| SyncError::Serialization(e.to_string()))
+}
+
+
 /// A report of a completed sync operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncReport {
@@ -368,40 +419,19 @@ impl LanBackend {
     }
 
     async fn write_message(&mut self, message: &SyncMessage) -> Result<(), SyncError> {
-        let bytes = postcard::to_allocvec(message)?;
-        let len = (bytes.len() as u32).to_le_bytes();
-        use tokio::io::AsyncWriteExt;
         let stream = self
             .stream
             .as_mut()
             .ok_or(SyncError::ConnectionDropped)?;
-        stream.write_all(&len).await.map_err(SyncError::Io)?;
-        stream
-            .write_all(&bytes)
-            .await
-            .map_err(SyncError::Io)?;
-        stream.flush().await.map_err(SyncError::Io)?;
-        Ok(())
+        write_frame(stream, message).await
     }
 
     async fn read_message(&mut self) -> Result<SyncMessage, SyncError> {
-        use tokio::io::AsyncReadExt;
         let stream = self
             .stream
             .as_mut()
             .ok_or(SyncError::ConnectionDropped)?;
-        let mut len_buf = [0u8; 4];
-        stream
-            .read_exact(&mut len_buf)
-            .await
-            .map_err(SyncError::Io)?;
-        let len = u32::from_le_bytes(len_buf) as usize;
-        let mut buf = vec![0u8; len];
-        stream
-            .read_exact(&mut buf)
-            .await
-            .map_err(SyncError::Io)?;
-        postcard::from_bytes(&buf).map_err(|e| SyncError::Serialization(e.to_string()))
+        read_frame(stream).await
     }
 }
 
@@ -442,30 +472,170 @@ impl Drop for LanBackend {
     }
 }
 
-/// A cloud relay backend (stub, feature-gated).
-#[cfg(feature = "cloud")]
-pub struct CloudBackend {
-    // Placeholder for future cloud relay implementation.
-    _private: (),
+/// Role of this side of a relay rendezvous.
+///
+/// Mirrors the auto-pairing roles: the dialing side is `Initiator`,
+/// the listening side is `Responder`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayRole {
+    /// The side that dials (sends `PairProbe` first).
+    Initiator,
+    /// The side that waits for a probe.
+    Responder,
 }
 
-#[cfg(feature = "cloud")]
+impl RelayRole {
+    /// Wire byte for this role.
+    pub fn as_byte(&self) -> u8 {
+        match self {
+            Self::Initiator => 0,
+            Self::Responder => 1,
+        }
+    }
+}
+
+/// Compute the relay room id for a database.
+///
+/// `BLAKE3(db_id)` — derivable by both peers from their shared database
+/// identity, but reveals nothing about `db_id` to the relay.
+pub fn relay_room_id(db_id: &[u8; 32]) -> [u8; 32] {
+    veildb_crypto::hash(db_id)
+}
+
+/// Hex-encode 32 bytes (used in handshake error messages).
+fn hex32(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A relay-backed backend for cross-network sync.
+///
+/// Opens a TCP stream to a blind rendezvous relay, sends the fixed
+/// 33-byte header `[room_id: 32][role: 1]`, and then speaks the exact
+/// same length-prefixed postcard framing as [`LanBackend`] — the relay
+/// pipes bytes verbatim and never parses them, so the 14-step protocol
+/// and its wire format are unchanged.
+pub struct CloudBackend {
+    stream: Option<tokio::net::TcpStream>,
+}
+
+impl CloudBackend {
+    /// Perform the relay rendezvous and return the raw TCP stream.
+    ///
+    /// After the 1-byte pairing status the relay is a transparent
+    /// pipe, so the stream speaks the exact framing of [`LanBackend`].
+    /// Core uses this to run its existing pairing + engine sessions
+    /// over a cross-network connection without duplicating protocol
+    /// logic.
+    pub async fn open_stream(
+        relay_addr: &str,
+        db_id: &[u8; 32],
+        role: RelayRole,
+    ) -> Result<tokio::net::TcpStream, SyncError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(relay_addr).await.map_err(|e| {
+            SyncError::BackendNotAvailable(format!(
+                "relay unreachable at {relay_addr}: {e}. Check the relay address and that \
+                 the relay server is running."
+            ))
+        })?;
+
+        // Fixed rendezvous header: [room_id: 32 bytes][role: 1 byte].
+        let mut header = [0u8; 33];
+        header[..32].copy_from_slice(&relay_room_id(db_id));
+        header[32] = role.as_byte();
+        stream.write_all(&header).await.map_err(|e| {
+            SyncError::BackendNotAvailable(format!("failed to reach relay {relay_addr}: {e}"))
+        })?;
+        stream.flush().await.map_err(SyncError::Io)?;
+
+        // The relay answers with a 1-byte status once the partner
+        // arrives: 0 = paired, 1 = partner not present (timeout),
+        // 2 = relay at capacity. Read it so we can report precisely.
+        let mut status = [0u8; 1];
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(75), stream.read(&mut status))
+                .await
+                .map_err(|_| {
+                    SyncError::BackendNotAvailable(
+                        "timed out waiting for the other device in the relay room. Ask it to \
+                         open VeilDB and start a relay sync too."
+                            .to_string(),
+                    )
+                })?
+                .map_err(|e| {
+                    SyncError::BackendNotAvailable(format!("relay closed the connection: {e}"))
+                })?;
+        if read == 0 {
+            return Err(SyncError::BackendNotAvailable(
+                "relay closed the connection before a partner joined the room. The other \
+                 device may not be syncing yet — open VeilDB there and start a relay sync."
+                    .to_string(),
+            ));
+        }
+        match status[0] {
+            0 => Ok(stream),
+            2 => Err(SyncError::BackendNotAvailable(
+                "relay is at capacity (too many rooms). Try again shortly.".to_string(),
+            )),
+            _ => Err(SyncError::BackendNotAvailable(
+                "partner was not present in the relay room. Make sure the other device has \
+                 VeilDB open and is running a relay sync with the same database/passphrase."
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// Connect to `relay_addr`, register in the room derived from
+    /// `db_id`, and wait for the partner socket to be paired.
+    ///
+    /// Error messages distinguish "relay unreachable" from "partner
+    /// never showed up" so the UI can give actionable advice.
+    pub async fn connect(
+        relay_addr: &str,
+        db_id: &[u8; 32],
+        role: RelayRole,
+    ) -> Result<Self, SyncError> {
+        let stream = Self::open_stream(relay_addr, db_id, role).await?;
+        Ok(Self { stream: Some(stream) })
+    }
+
+    /// Wrap an already-paired stream (used by tests that pipe two
+    /// sockets together in-process).
+    pub fn from_stream(stream: tokio::net::TcpStream) -> Self {
+        Self { stream: Some(stream) }
+    }
+}
+
 #[async_trait]
 impl SyncBackend for CloudBackend {
-    async fn send(&mut self, _message: SyncMessage) -> Result<(), SyncError> {
-        Err(SyncError::BackendNotAvailable(
-            "cloud backend not yet implemented".to_string(),
-        ))
+    async fn send(&mut self, message: SyncMessage) -> Result<(), SyncError> {
+        let stream = self.stream.as_mut().ok_or(SyncError::ConnectionDropped)?;
+        write_frame(stream, &message).await
     }
 
     async fn receive(&mut self) -> Result<SyncMessage, SyncError> {
-        Err(SyncError::BackendNotAvailable(
-            "cloud backend not yet implemented".to_string(),
-        ))
+        let stream = self.stream.as_mut().ok_or(SyncError::ConnectionDropped)?;
+        read_frame(stream).await
     }
 
     async fn close(&mut self) -> Result<(), SyncError> {
+        if let Some(stream) = self.stream.take() {
+            let _ = stream
+                .into_std()
+                .and_then(|s| s.shutdown(std::net::Shutdown::Both));
+        }
         Ok(())
+    }
+}
+
+impl Drop for CloudBackend {
+    fn drop(&mut self) {
+        if let Some(stream) = self.stream.take() {
+            let _ = stream
+                .into_std()
+                .and_then(|s| s.shutdown(std::net::Shutdown::Both));
+        }
     }
 }
 
@@ -723,6 +893,19 @@ impl<S: StorageEngine> SyncEngine<S> {
                 msg.extend_from_slice(&self.db_id);
                 verify_signature(public_key, &msg, signature)
                     .map_err(|_| SyncError::PeerAuthenticationFailed)?;
+                // Bind the claimed device_id to the presented key:
+                // locally, device_id is ALWAYS BLAKE3(public_key). A
+                // peer that claims someone else's device_id while
+                // proving possession of its own key would bypass the
+                // trust gate for a different identity.
+                let derived = veildb_crypto::hash(public_key);
+                if derived != *device_id {
+                    return Err(SyncError::InvalidPeerMessage(format!(
+                        "peer device_id does not match its public key (claimed {}, derived {})",
+                        hex32(device_id),
+                        hex32(&derived)
+                    )));
+                }
                 *device_id
             }
             SyncMessage::Error { message } => {
@@ -856,11 +1039,15 @@ impl<S: StorageEngine> SyncEngine<S> {
         };
 
         // Step 8: Verify operation hashes.
+        //
+        // Every received operation must hash to one of the hashes this
+        // peer advertised in step 6 — this is the anti-substitution
+        // check: the peer cannot send operations it did not commit to.
         for op in &peer_ops {
             let h = operation_hash(op);
-            // The hash must be one the peer claimed to have.
-            // We verify the hash is consistent with the operation.
-            let _ = h;
+            if !peer_hash_set.contains(&h) {
+                return Err(SyncError::OperationHashVerificationFailed);
+            }
         }
 
         // Step 9: Verify signatures.

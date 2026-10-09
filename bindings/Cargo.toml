@@ -25,3 +25,9 @@ tauri-plugin-dialog = "2"
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+
+# Windows-only: disable WebView2's built-in zoom/pinch so trackpad pinch
+# reaches the frontend as ctrl+wheel. Versions match Tauri's (unified by Cargo).
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.39"
+windows = { version = "0.62", features = ["Win32_Foundation"] }

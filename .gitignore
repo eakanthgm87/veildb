@@ -1,18 +1,153 @@
-/target
-**/*.rs.bk
-Cargo.lock
-*.db
-*.db-wal
-*.db-shm
-*.veildb
-*.vdb
-node_modules
-dist
-frontend/node_modules
-frontend/dist
-bindings/gen
-.idea
-.vscode
+# ===========================================================================
+# VeilDB — .gitignore
+# Project stack: Rust workspace (crates, cli, relay) + Tauri 2 desktop app
+#                + React/Vite/TypeScript frontend + SQLite (encrypted) storage
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# OS metadata
+# ---------------------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+desktop.ini
+$RECYCLE.BIN/
+
+# ---------------------------------------------------------------------------
+# Editors / IDEs
+# ---------------------------------------------------------------------------
+.idea/
+.vscode/
+.fleet/
+*.iml
 *.swp
 *.swo
-.DS_Store
+*.swn
+*~
+*.sublime-project
+*.sublime-workspace
+
+# ---------------------------------------------------------------------------
+# Rust / Cargo
+# ---------------------------------------------------------------------------
+# Build artifacts of the whole workspace (all crates build into /target).
+/target/
+# Rust backup / crash artifacts.
+**/*.rs.bk
+*.pdb
+# Coverage / profiling output.
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+
+# NOTE: Cargo.lock is intentionally NOT ignored. This repository ships
+# binaries (Tauri desktop app, CLI, relay), so the lockfile must be
+# committed to guarantee reproducible builds.
+
+# ---------------------------------------------------------------------------
+# Node / npm / yarn / pnpm / Vite
+# ---------------------------------------------------------------------------
+node_modules/
+dist/
+dist-ssr/
+.vite/
+.npm/
+.yarn/
+.pnpm-store/
+coverage/
+*.tsbuildinfo
+.nyc_output/
+
+# Debug logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+*.log
+nohup.out
+
+# Local env overrides (Vite loads .env.local etc.)
+*.local
+
+# ---------------------------------------------------------------------------
+# Environment variables & secrets — NEVER commit these
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+id_rsa*
+*.sec
+
+# ---------------------------------------------------------------------------
+# VeilDB / SQLite runtime data & databases — never commit user data
+# ---------------------------------------------------------------------------
+# SQLite databases and their write-ahead-log / shared-memory / journal twins
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite-journal
+*.db3
+
+# VeilDB vault files (extension .veildb / .vdb) + sidecar files
+*.veildb
+*.veildb-shm
+*.veildb-wal
+*.vdb
+*.vdb-shm
+*.vdb-wal
+*.vdb-journal
+
+# Backups, snapshots and temp files
+*.bak
+*.backup
+*.orig
+*.rej
+*.tmp
+*.temp
+
+# ---------------------------------------------------------------------------
+# Tauri generated output
+# ---------------------------------------------------------------------------
+# Schemas/ACL manifests generated at build time by tauri-build.
+bindings/gen/
+**/gen/schemas/
+
+# ---------------------------------------------------------------------------
+# Packaging / release artifacts
+# ---------------------------------------------------------------------------
+*.msi
+*.exe
+*.dmg
+*.appimage
+*.AppImage
+*.deb
+*.rpm
+*.snap
+release/*.AppImage
+
+# ---------------------------------------------------------------------------
+# Project-local tooling caches
+# ---------------------------------------------------------------------------
+.cache/
+.turbo/
+.eslintcache
+.stylelintcache
+.ruff_cache/
+.pytest_cache/

@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import logoUrl from "./assets/veildb-logo.png";
 import { api } from "./mockApi";
 
 /* ─── Types ─── */
@@ -7,6 +8,25 @@ interface UserEntry {
   email: string;
   role: string;
   createdAt: string;
+  /** SHA-256 hex of the password. Never store the plaintext. */
+  passwordHash?: string;
+}
+
+/* ─── Helpers ─── */
+
+/** Hash a password to hex. Uses Web Crypto; falls back if unavailable. */
+async function sha256Hex(s: string): Promise<string> {
+  try {
+    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+    return Array.from(new Uint8Array(buf))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  } catch {
+    // Non-cryptographic fallback — still avoids persisting the plaintext.
+    let h = 0;
+    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+    return "x" + h.toString(16);
+  }
 }
 
 interface VdbStats {
@@ -17,6 +37,39 @@ interface VdbStats {
 }
 
 /* ─── Helpers ─── */
+
+/* VeilDB logo mark. */
+function VeilLogo({ size = 40 }: { size?: number }) {
+  return (
+    <img src={logoUrl} alt="VeilDB" style={{ width: size, height: size, objectFit: "contain", flexShrink: 0 }} />
+  );
+}
+
+/* Accent dot for stat labels. */
+function Dot({ c }: { c: string }) {
+  return (
+    <span style={{
+      display: "inline-block", width: 6, height: 6, borderRadius: 999,
+      background: c, marginRight: 7, verticalAlign: "middle",
+    }} />
+  );
+}
+
+/* Tiny inline sparkline — rising "operations over time" line. */
+function Spark({ n, color }: { n: number; color: string }) {
+  const w = 120, h = 28;
+  const points = Math.min(Math.max(n, 2), 24);
+  const pts = Array.from({ length: points }, (_, i) =>
+    `${(i / (points - 1)) * w},${h - (i / (points - 1)) * (h - 4) - 2}`,
+  ).join(" ");
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none"
+      style={{ width: "100%", height: 24, marginTop: 8 }}>
+      <polyline points={pts} fill="none" stroke={color} strokeWidth="1.5"
+        strokeLinejoin="round" strokeLinecap="round" />
+    </svg>
+  );
+}
 
 /* ============================================================
    DemoSite — A standalone auth website powered by VeilDB
@@ -130,12 +183,13 @@ export default function DemoSite() {
         return;
       }
 
-      // Store user in VeilDB as key-value
+      // Store user in VeilDB as key-value (password kept only as a hash).
       const user: UserEntry = {
         username: regUsername,
         email: regEmail,
         role: regRole,
         createdAt: new Date().toISOString(),
+        passwordHash: await sha256Hex(regPassword),
       };
 
       // vdb_put("user:<username>", JSON)
@@ -179,14 +233,20 @@ export default function DemoSite() {
     }
     setLoading(true);
     try {
-      // vdb_get("user:<username>")
+      // vdb_get("user:<username>") then verify the password hash.
       const res = await api.get(`user:${loginUsername}`);
       if (res.success && res.data && res.data !== "") {
         const user: UserEntry = JSON.parse(res.data);
-        setCurrentUser(user);
-        showAlert("success", `Welcome back, ${user.username}!`);
-        await refreshDashboard();
-        setTimeout(() => setView("dashboard"), 600);
+        const hash = await sha256Hex(loginPassword);
+        if (user.passwordHash && user.passwordHash === hash) {
+          setCurrentUser(user);
+          setLoginPassword("");
+          showAlert("success", `Welcome back, ${user.username}!`);
+          await refreshDashboard();
+          setTimeout(() => setView("dashboard"), 600);
+        } else {
+          showAlert("error", "Invalid username or password");
+        }
       } else {
         showAlert("error", "Invalid username or password");
       }
@@ -219,6 +279,34 @@ export default function DemoSite() {
     setView("login");
   }
 
+  // Make the demo self-contained: if no database is open, open (or
+  // create) a dedicated demo database so login/register actually persist.
+  async function ensureDb() {
+    try {
+      const st = await api.status();
+      if (st.success) return; // a database is already open
+    } catch {
+      /* status errors when nothing is open — fall through to open it */
+    }
+    const path = "demo.vdb";
+    const pass = "veildb-demo";
+    const opened = await api.open(path, pass);
+    if (!opened.success) {
+      const created = await api.init(path, pass);
+      if (!created.success) {
+        showAlert(
+          "error",
+          created.error?.message || "Could not open the demo database"
+        );
+      }
+    }
+  }
+
+  useEffect(() => {
+    ensureDb();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useEffect(() => {
     if (view === "dashboard") refreshDashboard();
   }, [view]);
@@ -232,9 +320,7 @@ export default function DemoSite() {
       {/* Header */}
       <header style={S.header}>
         <div style={S.logoGroup}>
-          <div style={S.logoIcon}>V</div>
-          <span style={S.logoText}>VeilDB</span>
-          <span style={S.badge}>Live Demo</span>
+          <VeilLogo size={44} />
         </div>
         <nav style={S.nav}>
           <button
@@ -418,7 +504,7 @@ export default function DemoSite() {
             {/* Dashboard header */}
             <div style={S.dashHeader}>
               <div>
-                <h2 style={{ fontSize: "1.5rem", fontWeight: 700, margin: 0 }}>
+                <h2 style={{ ...S.logoText, fontSize: "1.9rem", margin: 0 }}>
                   Dashboard
                 </h2>
                 <p style={{ color: "#94a3b8", margin: "4px 0 0" }}>
@@ -437,15 +523,16 @@ export default function DemoSite() {
             {stats && (
               <div style={S.statsGrid}>
                 <div style={S.statCard}>
-                  <div style={S.statLabel}>TOTAL USERS</div>
+                  <div style={S.statLabel}><Dot c="#8b5cf6" />TOTAL USERS</div>
                   <div style={S.statValue}>{users.length}</div>
                 </div>
                 <div style={S.statCard}>
-                  <div style={S.statLabel}>VDB OPERATIONS</div>
+                  <div style={S.statLabel}><Dot c="#a78bfa" />VDB OPERATIONS</div>
                   <div style={S.statValue}>{stats.operationCount}</div>
+                  <Spark n={stats.operationCount} color="#a78bfa" />
                 </div>
                 <div style={S.statCard}>
-                  <div style={S.statLabel}>MERKLE ROOT</div>
+                  <div style={S.statLabel}><Dot c="#fbbf24" />MERKLE ROOT</div>
                   <div style={{ ...S.statValue, fontSize: "0.85rem", fontFamily: "monospace" }}>
                     {typeof stats.merkleRoot === "string"
                       ? stats.merkleRoot.slice(0, 16) + "…"
@@ -453,38 +540,11 @@ export default function DemoSite() {
                   </div>
                 </div>
                 <div style={S.statCard}>
-                  <div style={S.statLabel}>DEVICES</div>
+                  <div style={S.statLabel}><Dot c="#46e3b7" />DEVICES</div>
                   <div style={S.statValue}>{stats.deviceCount}</div>
                 </div>
               </div>
             )}
-
-            {/* How it works */}
-            <div style={S.infoBox}>
-              <h4 style={{ color: "#818cf8", margin: "0 0 8px", fontSize: "0.85rem" }}>
-                ⚡ How VeilDB stores this data
-              </h4>
-              <div style={{ fontFamily: "monospace", fontSize: "0.75rem", color: "#94a3b8", lineHeight: 1.8 }}>
-                <p>
-                  <span style={{ color: "#60a5fa" }}>PUT</span>{" "}
-                  <span style={{ color: "#fbbf24" }}>"user:alice"</span> →{" "}
-                  <span style={{ color: "#4ade80" }}>
-                    {`{"username":"alice","email":"...","role":"admin"}`}
-                  </span>
-                </p>
-                <p>
-                  <span style={{ color: "#60a5fa" }}>PUT</span>{" "}
-                  <span style={{ color: "#fbbf24" }}>"users:index"</span> →{" "}
-                  <span style={{ color: "#4ade80" }}>
-                    {`["alice","bob"]`}
-                  </span>
-                </p>
-                <p style={{ color: "#64748b", marginTop: 4 }}>
-                  Each PUT → signed hash-chained operation → updates Merkle
-                  tree. Check the VeilDB dashboard to see changes!
-                </p>
-              </div>
-            </div>
 
             {/* Users table */}
             <div style={S.section}>
@@ -566,7 +626,7 @@ export default function DemoSite() {
                     <div key={i} style={S.kvBox}>
                       <div>
                         <span style={{ color: "#fbbf24" }}>Key: </span>
-                        <span style={{ color: "#60a5fa" }}>{kv.key}</span>
+                        <span style={{ color: "#a78bfa" }}>{kv.key}</span>
                       </div>
                       <div style={{ marginTop: 4 }}>
                         <span style={{ color: "#fbbf24" }}>Val: </span>
@@ -586,7 +646,7 @@ export default function DemoSite() {
       {/* Footer */}
       <footer style={S.footer}>
         All user data is stored in a{" "}
-        <span style={{ color: "#60a5fa", fontWeight: 500 }}>
+        <span style={{ color: "#a78bfa", fontWeight: 500 }}>
           VeilDB encrypted key-value store
         </span>{" "}
         — privacy-first, local-first, zero-trust.
@@ -599,7 +659,7 @@ export default function DemoSite() {
 const S: Record<string, React.CSSProperties> = {
   page: {
     minHeight: "100vh",
-    background: "#060918",
+    background: "#000",
     color: "#e8edf5",
     fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
     display: "flex",
@@ -609,7 +669,7 @@ const S: Record<string, React.CSSProperties> = {
     position: "fixed",
     inset: 0,
     background:
-      "radial-gradient(ellipse 80% 60% at 20% 10%, rgba(59,130,246,0.06), transparent), radial-gradient(ellipse 60% 50% at 80% 80%, rgba(139,92,246,0.05), transparent)",
+      "radial-gradient(ellipse 80% 60% at 0% -8%, rgba(124,58,237,0.22), transparent 62%), radial-gradient(ellipse 70% 60% at 100% 108%, rgba(139,92,246,0.14), transparent 60%), linear-gradient(rgba(255,255,255,0.018) 1px, transparent 1px) 0 0/64px 64px, linear-gradient(90deg, rgba(255,255,255,0.018) 1px, transparent 1px) 0 0/64px 64px",
     pointerEvents: "none",
     zIndex: 0,
   },
@@ -621,28 +681,28 @@ const S: Record<string, React.CSSProperties> = {
     alignItems: "center",
     justifyContent: "space-between",
     padding: "1rem 2rem",
-    borderBottom: "1px solid rgba(100,130,200,0.12)",
+    borderBottom: "1px solid rgba(255,255,255,0.1)",
     backdropFilter: "blur(16px)",
-    background: "rgba(6,9,24,0.85)",
+    background: "rgba(6,4,12,0.82)",
   },
   logoGroup: { display: "flex", alignItems: "center", gap: 10 },
   logoIcon: {
     width: 36,
     height: 36,
-    borderRadius: 10,
-    background: "linear-gradient(135deg,#3b82f6,#6366f1,#8b5cf6)",
+    borderRadius: 2,
+    background: "linear-gradient(100deg,#8b5cf6,#a78bfa,#46e3b7)",
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
     fontSize: "1.1rem",
     fontWeight: 800,
     color: "white",
-    boxShadow: "0 4px 16px rgba(59,130,246,0.3)",
+    boxShadow: "0 4px 16px rgba(139,92,246,0.3)",
   },
   logoText: {
     fontSize: "1.35rem",
     fontWeight: 700,
-    background: "linear-gradient(135deg,#3b82f6,#6366f1,#8b5cf6)",
+    background: "linear-gradient(100deg,#8b5cf6,#a78bfa,#46e3b7)",
     WebkitBackgroundClip: "text",
     WebkitTextFillColor: "transparent",
   },
@@ -663,16 +723,16 @@ const S: Record<string, React.CSSProperties> = {
     border: "1px solid transparent",
     color: "#94a3b8",
     padding: "6px 14px",
-    borderRadius: 8,
+    borderRadius: 2,
     fontSize: "0.85rem",
     fontWeight: 500,
     cursor: "pointer",
     fontFamily: "inherit",
   },
   navBtnActive: {
-    color: "#60a5fa",
-    background: "rgba(59,130,246,0.12)",
-    borderColor: "rgba(59,130,246,0.2)",
+    color: "#a78bfa",
+    background: "rgba(139,92,246,0.12)",
+    borderColor: "rgba(139,92,246,0.2)",
   },
   main: {
     flex: 1,
@@ -686,11 +746,11 @@ const S: Record<string, React.CSSProperties> = {
   card: {
     width: "100%",
     maxWidth: 440,
-    background: "linear-gradient(145deg, rgba(30,41,59,0.5), rgba(15,23,42,0.9))",
-    border: "1px solid rgba(100,130,200,0.12)",
-    borderRadius: 20,
+    background: "linear-gradient(145deg, rgba(14,14,16,0.7), rgba(4,4,6,0.92))",
+    border: "1px solid rgba(255,255,255,0.12)",
+    borderRadius: 2,
     padding: "2.5rem",
-    boxShadow: "0 8px 32px rgba(0,0,0,0.3), 0 0 40px rgba(59,130,246,0.08)",
+    boxShadow: "0 8px 32px rgba(0,0,0,0.3), 0 0 40px rgba(139,92,246,0.08)",
     backdropFilter: "blur(20px)",
   },
   cardTitle: { fontSize: "1.5rem", fontWeight: 700, textAlign: "center", margin: "0 0 8px" },
@@ -701,8 +761,8 @@ const S: Record<string, React.CSSProperties> = {
     width: "100%",
     padding: "10px 12px",
     background: "rgba(10,16,32,0.8)",
-    border: "1px solid rgba(100,130,200,0.12)",
-    borderRadius: 8,
+    border: "1px solid rgba(255,255,255,0.12)",
+    borderRadius: 2,
     color: "#e8edf5",
     fontSize: "0.9rem",
     fontFamily: "inherit",
@@ -710,8 +770,8 @@ const S: Record<string, React.CSSProperties> = {
     boxSizing: "border-box",
   },
   code: {
-    background: "rgba(59,130,246,0.15)",
-    color: "#60a5fa",
+    background: "rgba(139,92,246,0.15)",
+    color: "#a78bfa",
     padding: "1px 6px",
     borderRadius: 4,
     fontSize: "0.8em",
@@ -720,23 +780,23 @@ const S: Record<string, React.CSSProperties> = {
   btnPrimary: {
     width: "100%",
     padding: "12px",
-    background: "linear-gradient(135deg,#3b82f6,#6366f1,#8b5cf6)",
+    background: "linear-gradient(100deg,#8b5cf6,#a78bfa,#46e3b7)",
     border: "none",
-    borderRadius: 8,
+    borderRadius: 2,
     color: "white",
     fontSize: "0.9rem",
     fontWeight: 600,
     cursor: "pointer",
     fontFamily: "inherit",
-    boxShadow: "0 4px 16px rgba(59,130,246,0.25)",
+    boxShadow: "0 4px 16px rgba(139,92,246,0.25)",
     marginTop: 8,
   },
   btnSecondary: {
     padding: "6px 14px",
-    background: "rgba(59,130,246,0.1)",
-    border: "1px solid rgba(59,130,246,0.2)",
-    borderRadius: 8,
-    color: "#60a5fa",
+    background: "rgba(139,92,246,0.1)",
+    border: "1px solid rgba(139,92,246,0.2)",
+    borderRadius: 2,
+    color: "#a78bfa",
     fontSize: "0.8rem",
     fontWeight: 500,
     cursor: "pointer",
@@ -746,21 +806,21 @@ const S: Record<string, React.CSSProperties> = {
     padding: "4px 10px",
     background: "rgba(239,68,68,0.15)",
     border: "1px solid rgba(239,68,68,0.25)",
-    borderRadius: 6,
+    borderRadius: 2,
     color: "#fca5a5",
     fontSize: "0.75rem",
     cursor: "pointer",
     fontFamily: "inherit",
   },
   toggleText: { textAlign: "center", marginTop: 20, fontSize: "0.85rem", color: "#94a3b8" },
-  link: { color: "#60a5fa", cursor: "pointer", fontWeight: 500 },
+  link: { color: "#a78bfa", cursor: "pointer", fontWeight: 500 },
   alert: {
     position: "fixed",
     top: 80,
     left: "50%",
     transform: "translateX(-50%)",
     padding: "10px 20px",
-    borderRadius: 8,
+    borderRadius: 2,
     fontSize: "0.85rem",
     zIndex: 100,
     maxWidth: 500,
@@ -777,9 +837,9 @@ const S: Record<string, React.CSSProperties> = {
     color: "#fca5a5",
   },
   alertInfo: {
-    background: "rgba(59,130,246,0.15)",
-    border: "1px solid rgba(59,130,246,0.3)",
-    color: "#60a5fa",
+    background: "rgba(139,92,246,0.15)",
+    border: "1px solid rgba(139,92,246,0.3)",
+    color: "#a78bfa",
   },
   dashboard: { width: "100%", maxWidth: 900 },
   dashHeader: {
@@ -795,9 +855,9 @@ const S: Record<string, React.CSSProperties> = {
     marginBottom: 24,
   },
   statCard: {
-    background: "linear-gradient(145deg, rgba(30,41,59,0.5), rgba(15,23,42,0.9))",
-    border: "1px solid rgba(100,130,200,0.12)",
-    borderRadius: 12,
+    background: "linear-gradient(145deg, rgba(14,14,16,0.7), rgba(4,4,6,0.92))",
+    border: "1px solid rgba(255,255,255,0.12)",
+    borderRadius: 2,
     padding: 16,
   },
   statLabel: {
@@ -810,7 +870,7 @@ const S: Record<string, React.CSSProperties> = {
   statValue: {
     fontSize: "1.75rem",
     fontWeight: 700,
-    background: "linear-gradient(135deg,#3b82f6,#6366f1,#8b5cf6)",
+    background: "linear-gradient(100deg,#8b5cf6,#a78bfa,#46e3b7)",
     WebkitBackgroundClip: "text",
     WebkitTextFillColor: "transparent",
   },
@@ -820,21 +880,21 @@ const S: Record<string, React.CSSProperties> = {
     borderRadius: 20,
     fontSize: "0.75rem",
     fontWeight: 500,
-    background: "rgba(59,130,246,0.15)",
-    color: "#60a5fa",
-    border: "1px solid rgba(59,130,246,0.25)",
+    background: "rgba(139,92,246,0.15)",
+    color: "#a78bfa",
+    border: "1px solid rgba(139,92,246,0.25)",
   },
   infoBox: {
     background: "rgba(30,41,59,0.5)",
     border: "1px solid rgba(99,102,241,0.2)",
-    borderRadius: 12,
+    borderRadius: 2,
     padding: 16,
     marginBottom: 24,
   },
   section: {
-    background: "linear-gradient(145deg, rgba(30,41,59,0.5), rgba(15,23,42,0.9))",
-    border: "1px solid rgba(100,130,200,0.12)",
-    borderRadius: 16,
+    background: "linear-gradient(145deg, rgba(14,14,16,0.7), rgba(4,4,6,0.92))",
+    border: "1px solid rgba(255,255,255,0.12)",
+    borderRadius: 2,
     padding: 20,
     marginBottom: 20,
   },
@@ -848,12 +908,12 @@ const S: Record<string, React.CSSProperties> = {
     color: "#64748b",
     textTransform: "uppercase",
     letterSpacing: "0.05em",
-    borderBottom: "1px solid rgba(100,130,200,0.12)",
+    borderBottom: "1px solid rgba(255,255,255,0.12)",
   },
   td: {
     padding: "10px 12px",
     fontSize: "0.85rem",
-    borderBottom: "1px solid rgba(100,130,200,0.06)",
+    borderBottom: "1px solid rgba(255,255,255,0.06)",
   },
   avatar: {
     width: 32,
@@ -868,8 +928,8 @@ const S: Record<string, React.CSSProperties> = {
   },
   kvBox: {
     background: "rgba(10,16,32,0.6)",
-    border: "1px solid rgba(100,130,200,0.1)",
-    borderRadius: 8,
+    border: "1px solid rgba(255,255,255,0.1)",
+    borderRadius: 2,
     padding: 10,
     fontFamily: "monospace",
     fontSize: "0.75rem",
@@ -879,7 +939,7 @@ const S: Record<string, React.CSSProperties> = {
     padding: "1.5rem",
     fontSize: "0.8rem",
     color: "#64748b",
-    borderTop: "1px solid rgba(100,130,200,0.12)",
+    borderTop: "1px solid rgba(255,255,255,0.12)",
     position: "relative",
     zIndex: 1,
   },

@@ -1,0 +1,17 @@
+[package]
+name = "veildb-relay"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Blind byte-forwarding rendezvous relay for VeilDB cross-network sync"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[lib]
+name = "veildb_relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "veildb-relay"
+path = "src/main.rs"
